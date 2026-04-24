@@ -22,6 +22,17 @@ interface Props {
 const EM_DASH = '—'
 const CRYPTO_TECH_UNDERLYINGS = ['BTC', 'ETH', 'SOL', 'XRP'] as const
 
+// Slice D6 fix: backend Pydantic datetimes serialize as naive ISO
+// ("2026-04-24T17:38:01.875164", no 'Z' or offset). JavaScript's
+// `new Date()` parses such strings as LOCAL time, which made the
+// "last trade X ago" display drift by the user's UTC offset (4h on
+// EDT). Normalizing to UTC here — append 'Z' when no timezone marker is
+// present — keeps the age math accurate regardless of the viewer's tz.
+function parseBackendDate(iso: string): Date {
+  const hasTz = /Z|[+-]\d{2}:?\d{2}$/.test(iso)
+  return new Date(hasTz ? iso : `${iso}Z`)
+}
+
 // A settled-trade floor below which win rate is too noisy to trust.
 // Aligns with the backend's MIN_TRADES_FOR_CALIBRATION intent (100) but
 // relaxed for display — we still want to show ~10-sample rates with a
@@ -184,7 +195,7 @@ function TechnicalCard({ data }: { data?: DashboardData }) {
       .sort()
       .pop() ?? null
   const lastActivityText = lastTradeIso
-    ? `${formatDistanceToNow(new Date(lastTradeIso))} ago`
+    ? `${formatDistanceToNow(parseBackendDate(lastTradeIso))} ago`
     : 'no activity'
 
   const winRateDisplay = (() => {
@@ -293,7 +304,7 @@ function stripKalshiPrefix(ticker: string): string {
 
 function formatSettlementCountdown(iso: string | null): string {
   if (!iso) return 'settlement unknown'
-  const then = new Date(iso).getTime()
+  const then = parseBackendDate(iso).getTime()
   if (Number.isNaN(then)) return 'settlement unknown'
   const diffMs = then - Date.now()
   if (diffMs <= 0) return 'settling'
@@ -331,7 +342,7 @@ function OpenPositionRow({ pos }: { pos: McOpenPosition }) {
 
 function formatNextScan(iso: string | null | undefined): string {
   if (!iso) return 'scan due'
-  const then = new Date(iso).getTime()
+  const then = parseBackendDate(iso).getTime()
   if (Number.isNaN(then)) return 'scan due'
   const diffMs = then - Date.now()
   if (diffMs <= 0) return 'scan due'

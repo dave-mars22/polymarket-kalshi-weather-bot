@@ -9,7 +9,7 @@ import { SignalsTable } from './components/SignalsTable'
 import { TradesTable } from './components/TradesTable'
 import { EquityChart } from './components/EquityChart'
 import { Terminal } from './components/Terminal'
-import { MicrostructurePanel } from './components/MicrostructurePanel'
+import { MultiAssetMicrostructure } from './components/MultiAssetMicrostructure'
 import { CalibrationPanel } from './components/CalibrationPanel'
 import { EdgeDistribution } from './components/EdgeDistribution'
 import { formatCountdown } from './utils'
@@ -96,7 +96,6 @@ function App() {
 
   const activeSignals = data?.active_signals ?? []
   const recentTrades = data?.recent_trades ?? []
-  const micro = data?.microstructure
   const windows = data?.windows ?? []
 
   const stats = data?.stats ?? {
@@ -198,20 +197,17 @@ function App() {
 
         {/* ===== LEFT COLUMN ===== */}
         <div className="flex flex-col border-r border-neutral-800 min-h-0 overflow-hidden">
-          {/* Microstructure */}
-          {micro && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              className="shrink-0 border-b border-neutral-800 px-2 py-2"
-            >
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-[10px] text-neutral-500 uppercase tracking-wider">Microstructure</span>
-                <span className="text-[9px] text-neutral-600 tabular-nums">{micro.source}</span>
-              </div>
-              <MicrostructurePanel micro={micro} />
-            </motion.div>
-          )}
+          {/* Microstructure — slice D6 swapped to MultiAssetMicrostructure.
+              The component renders its own title + source caption so we
+              don't duplicate it here. Wrapper stays for entrance animation
+              + padding parity with the original panel. */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="shrink-0 border-b border-neutral-800 px-2 py-2"
+          >
+            <MultiAssetMicrostructure data={data} />
+          </motion.div>
 
           {/* Equity chart */}
           <div className="border-b border-neutral-800" style={{ height: '28%', minHeight: '120px' }}>

@@ -1,12 +1,14 @@
 """FastAPI backend for BTC 5-min trading bot dashboard."""
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Dict, List, Optional
 import asyncio
 import json
 import os
+import re
 
 from backend.config import settings
 from backend.models.database import (
@@ -112,6 +114,12 @@ class SignalResponse(BaseModel):
     underlying_change_24h: float = 0.0
     window_end: Optional[datetime] = None
     actionable: bool = False
+    # Slice D2: multi-strategy attribution fields. Populated from either the
+    # live TradingSignal.underlying (BTC brain path) or the Signal DB row
+    # (MC brain path). Optional so older clients ignoring them keep working.
+    underlying_asset: Optional[str] = None
+    asset_class: Optional[str] = None
+    contract_style: Optional[str] = None
 
 
 class TradeResponse(BaseModel):
@@ -126,6 +134,12 @@ class TradeResponse(BaseModel):
     settled: bool
     result: str
     pnl: Optional[float]
+    # Slice D2: multi-strategy attribution fields read directly from the
+    # Trade row (all three columns already exist; see models/database.py).
+    market_type: Optional[str] = None
+    underlying_asset: Optional[str] = None
+    asset_class: Optional[str] = None
+    contract_style: Optional[str] = None
 
 
 class BotStats(BaseModel):
@@ -154,6 +168,87 @@ class CalibrationSummary(BaseModel):
     brier_score: float
 
 
+class MultiMicrostructure(BaseModel):
+    """Per-underlying microstructure + spot price snapshot (slice D2).
+
+    Parallel to the singular `microstructure` field on DashboardData which
+    remains BTC-only for backward compatibility. Missing underlyings (fetch
+    failure) are simply absent from the dicts rather than set to null.
+    """
+    microstructures: Dict[str, MicrostructureResponse] = {}
+    prices: Dict[str, float] = {}
+
+
+class PerStrategyStats(BaseModel):
+    """Trade aggregates split by the strategy that produced them (slice D2).
+
+    strategy is one of:
+      - "crypto_tech"   (rows where trades.market_type = 'btc')
+      - "monte_carlo"   (rows where trades.market_type = 'monte_carlo')
+
+    `allocated_bankroll` is the pool each strategy draws from:
+    BotState.bankroll for crypto_tech, the MC pilot constant for monte_carlo.
+    `realized_bankroll` = allocated_bankroll adjusted by the strategy's own
+    cumulative settled PnL (so the MC pilot's realized bank reflects only
+    MC trades, not the shared pool).
+    """
+    strategy: str
+    total_trades: int
+    settled_trades: int
+    pending_trades: int
+    wins: int
+    losses: int
+    win_rate: Optional[float] = None
+    total_pnl: float
+    pnl_24h: float
+    allocated_bankroll: float
+    realized_bankroll: float
+
+
+class PerAssetStats(BaseModel):
+    """Crypto-tech trade aggregates split by underlying asset (slice D2).
+
+    Only covers market_type='btc' rows. Legacy pre-slice-3e BTC trades with
+    underlying_asset=NULL are excluded by design — see scheduler.py comment
+    on the same filter. The response always includes an entry for every
+    configured CRYPTO_TECH_UNDERLYINGS symbol, even when zero trades exist.
+    """
+    underlying: str
+    total_trades: int
+    settled_trades: int
+    pending_trades: int
+    wins: int
+    losses: int
+    win_rate: Optional[float] = None
+    total_pnl: float
+    pnl_24h: float
+    last_signal_time: Optional[datetime] = None
+    last_trade_time: Optional[datetime] = None
+
+
+class McOpenPosition(BaseModel):
+    trade_id: int
+    market_ticker: str
+    underlying: str
+    direction: str                        # "yes" or "no"
+    entry_price: float
+    size: float
+    model_probability: float
+    timestamp: datetime
+    expected_settlement: Optional[datetime] = None
+
+
+class McPortfolioStatus(BaseModel):
+    """MC-brain portfolio snapshot. Pilot bankroll is derived, not stored."""
+    pilot_bankroll_target: float
+    realized_pilot_bankroll: float
+    open_positions: List[McOpenPosition]
+    total_allocated: float
+    signals_last_24h: int
+    actionable_signals_last_24h: int
+    next_scheduled_scan: Optional[datetime] = None
+
+
 class DashboardData(BaseModel):
     stats: BotStats
     btc_price: Optional[BtcPriceResponse]
@@ -163,6 +258,11 @@ class DashboardData(BaseModel):
     recent_trades: List[TradeResponse]
     equity_curve: List[dict]
     calibration: Optional[CalibrationSummary] = None
+    # Slice D2: additive per-strategy / per-asset visibility.
+    multi_microstructure: Optional[MultiMicrostructure] = None
+    per_strategy_stats: List[PerStrategyStats] = []
+    per_asset_stats: List[PerAssetStats] = []
+    mc_portfolio: Optional[McPortfolioStatus] = None
 
 
 class EventResponse(BaseModel):
@@ -326,9 +426,13 @@ async def get_actionable_signals():
 
 
 def _signal_to_response(s: TradingSignal, actionable: bool = False) -> SignalResponse:
+    # Slice D2: carry multi-asset attribution. TradingSignal.underlying is
+    # already populated per-asset (BTC/ETH/SOL/XRP). contract_style is None
+    # for the technical brain — those are plain European 5-min up/down.
+    underlying = (s.underlying or "").upper() or None
     return SignalResponse(
         market_ticker=s.market.market_id,
-        market_title=f"BTC 5m - {s.market.slug}",
+        market_title=f"{underlying or 'BTC'} 5m - {s.market.slug}",
         platform="polymarket",
         direction=s.direction,
         model_probability=s.model_probability,
@@ -344,6 +448,61 @@ def _signal_to_response(s: TradingSignal, actionable: bool = False) -> SignalRes
         underlying_change_24h=s.underlying_change_24h,
         window_end=s.market.window_end,
         actionable=actionable,
+        underlying_asset=underlying,
+        asset_class="crypto" if underlying else None,
+        contract_style=None,
+    )
+
+
+def _db_signal_to_response(sig: Signal) -> SignalResponse:
+    """Serialize a persisted Signal row (used by /api/mc/signals)."""
+    return SignalResponse(
+        market_ticker=sig.market_ticker,
+        market_title=sig.market_ticker,  # no slug on DB row; ticker is the label
+        platform=sig.platform or "",
+        direction=sig.direction or "",
+        model_probability=sig.model_probability or 0.0,
+        market_probability=sig.market_price or 0.0,
+        edge=sig.edge or 0.0,
+        confidence=sig.confidence or 0.0,
+        suggested_size=sig.suggested_size or 0.0,
+        reasoning=sig.reasoning or "",
+        timestamp=sig.timestamp,
+        category=sig.asset_class or "",
+        event_slug=None,
+        underlying_price=0.0,
+        underlying_change_24h=0.0,
+        window_end=None,
+        actionable=bool(sig.edge is not None and abs(sig.edge) >= (
+            settings.MC_MIN_EDGE_THRESHOLD
+            if sig.market_type == "monte_carlo"
+            else settings.MIN_EDGE_THRESHOLD
+        )),
+        underlying_asset=sig.underlying_asset,
+        asset_class=sig.asset_class,
+        contract_style=sig.contract_style,
+    )
+
+
+def _trade_to_response(t: Trade) -> TradeResponse:
+    """Serialize a Trade row; centralized so D2 attribution fields flow
+    through every endpoint that returns trades."""
+    return TradeResponse(
+        id=t.id,
+        market_ticker=t.market_ticker,
+        platform=t.platform,
+        event_slug=t.event_slug,
+        direction=t.direction,
+        entry_price=t.entry_price,
+        size=t.size,
+        timestamp=t.timestamp,
+        settled=t.settled,
+        result=t.result,
+        pnl=t.pnl,
+        market_type=t.market_type,
+        underlying_asset=t.underlying_asset,
+        asset_class=t.asset_class,
+        contract_style=t.contract_style,
     )
 
 
@@ -358,22 +517,7 @@ async def get_trades(
         query = query.filter(Trade.result == status)
     trades = query.order_by(Trade.timestamp.desc()).limit(limit).all()
 
-    return [
-        TradeResponse(
-            id=t.id,
-            market_ticker=t.market_ticker,
-            platform=t.platform,
-            event_slug=t.event_slug,
-            direction=t.direction,
-            entry_price=t.entry_price,
-            size=t.size,
-            timestamp=t.timestamp,
-            settled=t.settled,
-            result=t.result,
-            pnl=t.pnl
-        )
-        for t in trades
-    ]
+    return [_trade_to_response(t) for t in trades]
 
 
 @app.get("/api/equity-curve")
@@ -486,6 +630,295 @@ async def settle_trades_endpoint(db: Session = Depends(get_db)):
         "settled_count": len(settled),
         "trades": [{"id": t.id, "result": t.result, "pnl": t.pnl} for t in settled]
     }
+
+
+def _configured_tech_underlyings() -> List[str]:
+    """Current CRYPTO_TECH_UNDERLYINGS list, upper-cased + de-duped."""
+    raw = settings.CRYPTO_TECH_UNDERLYINGS or ""
+    out: List[str] = []
+    for part in raw.split(","):
+        sym = part.strip().upper()
+        if sym and sym not in out:
+            out.append(sym)
+    return out
+
+
+# Kalshi monthly-style tickers embed the settlement date as YYMMMDD (e.g.
+# KXBTCMAXMON-26APR30-8000000 -> 2026-04-30). For other shapes we return
+# None rather than guess. Parsing must never raise on malformed input.
+_KALSHI_DATE_RE = re.compile(r"(\d{2})([A-Z]{3})(\d{2})")
+_MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+
+def _parse_kalshi_expected_settlement(ticker: str) -> Optional[datetime]:
+    """Best-effort parse of a settlement date from a Kalshi ticker.
+
+    Returns the end of the matched day (23:59:59 UTC) so callers have a
+    conservative settlement estimate. Returns None when no YYMMMDD token
+    is present — we never fabricate a date.
+    """
+    if not ticker:
+        return None
+    m = _KALSHI_DATE_RE.search(ticker)
+    if not m:
+        return None
+    yy, mmm, dd = m.group(1), m.group(2), m.group(3)
+    month = _MONTHS.get(mmm)
+    if month is None:
+        return None
+    try:
+        year = 2000 + int(yy)
+        day = int(dd)
+        return datetime(year, month, day, 23, 59, 59)
+    except (ValueError, TypeError):
+        return None
+
+
+def _build_per_strategy_stats(db: Session) -> List[PerStrategyStats]:
+    """Aggregate the Trade table by market_type for slice D2 portfolio views.
+
+    crypto_tech is labeled as 'crypto_tech' in the response even though the
+    DB column uses the legacy 'btc' value — the rename would require a
+    migration, and this slice is additive-only.
+    """
+    cutoff_24h = datetime.utcnow() - timedelta(hours=24)
+    mc_total_pnl = float(
+        db.query(func.coalesce(func.sum(Trade.pnl), 0.0))
+        .filter(Trade.market_type == "monte_carlo", Trade.settled == True)  # noqa: E712
+        .scalar() or 0.0
+    )
+    state = db.query(BotState).first()
+    tech_allocated = float(state.bankroll) if state else float(settings.INITIAL_BANKROLL)
+
+    out: List[PerStrategyStats] = []
+    for strategy_label, market_type_value, allocated in (
+        ("crypto_tech", "btc", tech_allocated),
+        ("monte_carlo", "monte_carlo", float(settings.MC_PILOT_BANKROLL_USD)),
+    ):
+        base = db.query(Trade).filter(Trade.market_type == market_type_value)
+        total = base.count()
+        settled = base.filter(Trade.settled == True).count()  # noqa: E712
+        pending = base.filter(Trade.settled == False).count()  # noqa: E712
+        wins = base.filter(Trade.result == "win").count()
+        losses = base.filter(Trade.result == "loss").count()
+        total_pnl = float(
+            db.query(func.coalesce(func.sum(Trade.pnl), 0.0))
+            .filter(Trade.market_type == market_type_value, Trade.settled == True)  # noqa: E712
+            .scalar() or 0.0
+        )
+        pnl_24h = float(
+            db.query(func.coalesce(func.sum(Trade.pnl), 0.0))
+            .filter(
+                Trade.market_type == market_type_value,
+                Trade.settled == True,  # noqa: E712
+                Trade.settlement_time.isnot(None),
+                Trade.settlement_time >= cutoff_24h,
+            ).scalar() or 0.0
+        )
+        # For crypto_tech the shared bankroll already reflects realized PnL;
+        # the MC pilot is notional so realized = target + MC PnL.
+        if strategy_label == "crypto_tech":
+            realized = allocated
+        else:
+            realized = allocated + mc_total_pnl
+        win_rate = (wins / settled) if settled > 0 else None
+        out.append(PerStrategyStats(
+            strategy=strategy_label,
+            total_trades=total,
+            settled_trades=settled,
+            pending_trades=pending,
+            wins=wins,
+            losses=losses,
+            win_rate=win_rate,
+            total_pnl=total_pnl,
+            pnl_24h=pnl_24h,
+            allocated_bankroll=allocated,
+            realized_bankroll=realized,
+        ))
+    return out
+
+
+def _build_per_asset_stats(db: Session) -> List[PerAssetStats]:
+    """Per-underlying view of the crypto_tech brain.
+
+    Filters on market_type='btc' AND underlying_asset IS NOT NULL; the
+    pre-slice-3e BTC history with NULL underlying is excluded so counts
+    don't double-attribute (matches the scheduler's allocation-query
+    convention).
+    """
+    cutoff_24h = datetime.utcnow() - timedelta(hours=24)
+    out: List[PerAssetStats] = []
+    for underlying in _configured_tech_underlyings():
+        base = db.query(Trade).filter(
+            Trade.market_type == "btc",
+            Trade.underlying_asset == underlying,
+        )
+        total = base.count()
+        settled = base.filter(Trade.settled == True).count()  # noqa: E712
+        pending = base.filter(Trade.settled == False).count()  # noqa: E712
+        wins = base.filter(Trade.result == "win").count()
+        losses = base.filter(Trade.result == "loss").count()
+        total_pnl = float(
+            db.query(func.coalesce(func.sum(Trade.pnl), 0.0))
+            .filter(
+                Trade.market_type == "btc",
+                Trade.underlying_asset == underlying,
+                Trade.settled == True,  # noqa: E712
+            ).scalar() or 0.0
+        )
+        pnl_24h = float(
+            db.query(func.coalesce(func.sum(Trade.pnl), 0.0))
+            .filter(
+                Trade.market_type == "btc",
+                Trade.underlying_asset == underlying,
+                Trade.settled == True,  # noqa: E712
+                Trade.settlement_time.isnot(None),
+                Trade.settlement_time >= cutoff_24h,
+            ).scalar() or 0.0
+        )
+        last_trade = (
+            db.query(Trade.timestamp)
+            .filter(Trade.market_type == "btc", Trade.underlying_asset == underlying)
+            .order_by(Trade.timestamp.desc())
+            .first()
+        )
+        last_signal = (
+            db.query(Signal.timestamp)
+            .filter(Signal.market_type == "btc", Signal.underlying_asset == underlying)
+            .order_by(Signal.timestamp.desc())
+            .first()
+        )
+        win_rate = (wins / settled) if settled > 0 else None
+        out.append(PerAssetStats(
+            underlying=underlying,
+            total_trades=total,
+            settled_trades=settled,
+            pending_trades=pending,
+            wins=wins,
+            losses=losses,
+            win_rate=win_rate,
+            total_pnl=total_pnl,
+            pnl_24h=pnl_24h,
+            last_signal_time=last_signal[0] if last_signal else None,
+            last_trade_time=last_trade[0] if last_trade else None,
+        ))
+    return out
+
+
+def _build_mc_portfolio_status(db: Session) -> McPortfolioStatus:
+    """MC brain state: pilot bankroll (derived), open positions, 24h signal counts."""
+    mc_total_pnl = float(
+        db.query(func.coalesce(func.sum(Trade.pnl), 0.0))
+        .filter(Trade.market_type == "monte_carlo", Trade.settled == True)  # noqa: E712
+        .scalar() or 0.0
+    )
+    open_rows = (
+        db.query(Trade)
+        .filter(Trade.market_type == "monte_carlo", Trade.settled == False)  # noqa: E712
+        .order_by(Trade.timestamp.desc())
+        .all()
+    )
+    open_positions = [
+        McOpenPosition(
+            trade_id=t.id,
+            market_ticker=t.market_ticker,
+            underlying=t.underlying_asset or "",
+            direction=t.direction or "",
+            entry_price=t.entry_price or 0.0,
+            size=t.size or 0.0,
+            model_probability=t.model_probability or 0.0,
+            timestamp=t.timestamp,
+            expected_settlement=_parse_kalshi_expected_settlement(t.market_ticker),
+        )
+        for t in open_rows
+    ]
+    total_allocated = float(sum(p.size for p in open_positions))
+
+    cutoff_24h = datetime.utcnow() - timedelta(hours=24)
+    signals_last_24h = (
+        db.query(Signal)
+        .filter(Signal.market_type == "monte_carlo", Signal.timestamp >= cutoff_24h)
+        .count()
+    )
+    actionable_last_24h = (
+        db.query(Signal)
+        .filter(
+            Signal.market_type == "monte_carlo",
+            Signal.timestamp >= cutoff_24h,
+            func.abs(Signal.edge) >= settings.MC_MIN_EDGE_THRESHOLD,
+        )
+        .count()
+    )
+
+    # Scheduler's next_run_time is only available if the job is registered.
+    next_scan: Optional[datetime] = None
+    try:
+        from backend.core.scheduler import scheduler as _sched
+        if _sched is not None:
+            job = _sched.get_job("mc_scan")
+            if job is not None and job.next_run_time is not None:
+                nrt = job.next_run_time
+                next_scan = nrt.replace(tzinfo=None) if nrt.tzinfo else nrt
+    except Exception:
+        next_scan = None
+
+    return McPortfolioStatus(
+        pilot_bankroll_target=float(settings.MC_PILOT_BANKROLL_USD),
+        realized_pilot_bankroll=float(settings.MC_PILOT_BANKROLL_USD) + mc_total_pnl,
+        open_positions=open_positions,
+        total_allocated=total_allocated,
+        signals_last_24h=signals_last_24h,
+        actionable_signals_last_24h=actionable_last_24h,
+        next_scheduled_scan=next_scan,
+    )
+
+
+async def _build_multi_microstructure() -> MultiMicrostructure:
+    """Fetch microstructure + spot price for every configured tech underlying.
+
+    Runs all underlyings concurrently via asyncio.gather. Per-underlying
+    failures are swallowed so one dead exchange adapter doesn't null the
+    whole response — missing symbols are simply absent from the dicts.
+    """
+    underlyings = _configured_tech_underlyings()
+    if not underlyings:
+        return MultiMicrostructure()
+
+    micro_tasks = [compute_crypto_microstructure(u) for u in underlyings]
+    price_tasks = [fetch_crypto_price(u) for u in underlyings]
+    micros, prices = await asyncio.gather(
+        asyncio.gather(*micro_tasks, return_exceptions=True),
+        asyncio.gather(*price_tasks, return_exceptions=True),
+    )
+
+    micro_map: Dict[str, MicrostructureResponse] = {}
+    price_map: Dict[str, float] = {}
+    for u, micro in zip(underlyings, micros):
+        if isinstance(micro, Exception) or micro is None:
+            continue
+        micro_map[u] = MicrostructureResponse(
+            rsi=micro.rsi,
+            momentum_1m=micro.momentum_1m,
+            momentum_5m=micro.momentum_5m,
+            momentum_15m=micro.momentum_15m,
+            vwap_deviation=micro.vwap_deviation,
+            sma_crossover=micro.sma_crossover,
+            volatility=micro.volatility,
+            price=micro.price,
+            source=micro.source,
+        )
+        # Micro already has a current_price; use it as the default spot so a
+        # CoinGecko outage on one symbol still yields a usable price.
+        price_map[u] = float(micro.price)
+    for u, price in zip(underlyings, prices):
+        if isinstance(price, Exception) or price is None:
+            continue
+        price_map[u] = float(price.current_price)
+
+    return MultiMicrostructure(microstructures=micro_map, prices=price_map)
 
 
 def _compute_calibration_summary(db: Session) -> Optional[CalibrationSummary]:
@@ -755,22 +1188,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
 
     # Recent trades
     trades = db.query(Trade).order_by(Trade.timestamp.desc()).limit(50).all()
-    recent_trades = [
-        TradeResponse(
-            id=t.id,
-            market_ticker=t.market_ticker,
-            platform=t.platform,
-            event_slug=t.event_slug,
-            direction=t.direction,
-            entry_price=t.entry_price,
-            size=t.size,
-            timestamp=t.timestamp,
-            settled=t.settled,
-            result=t.result,
-            pnl=t.pnl
-        )
-        for t in trades
-    ]
+    recent_trades = [_trade_to_response(t) for t in trades]
 
     # Equity curve
     equity_trades = db.query(Trade).filter(Trade.settled == True).order_by(Trade.timestamp).all()
@@ -788,6 +1206,26 @@ async def get_dashboard(db: Session = Depends(get_db)):
     # Calibration summary
     calibration = _compute_calibration_summary(db)
 
+    # Slice D2: multi-asset + multi-strategy visibility. All four blocks
+    # degrade to sensible empty values on failure so the dashboard never
+    # breaks on a new field — contract preserved with older clients.
+    try:
+        multi_micro = await _build_multi_microstructure()
+    except Exception:
+        multi_micro = MultiMicrostructure()
+    try:
+        per_strategy = _build_per_strategy_stats(db)
+    except Exception:
+        per_strategy = []
+    try:
+        per_asset = _build_per_asset_stats(db)
+    except Exception:
+        per_asset = []
+    try:
+        mc_portfolio = _build_mc_portfolio_status(db)
+    except Exception:
+        mc_portfolio = None
+
     return DashboardData(
         stats=stats,
         btc_price=btc_price_data,
@@ -797,6 +1235,77 @@ async def get_dashboard(db: Session = Depends(get_db)):
         recent_trades=recent_trades,
         equity_curve=equity_curve,
         calibration=calibration,
+        multi_microstructure=multi_micro,
+        per_strategy_stats=per_strategy,
+        per_asset_stats=per_asset,
+        mc_portfolio=mc_portfolio,
+    )
+
+
+# Slice D2: MC-specific read endpoints. All are pure DB queries with no
+# network side effects — safe to poll independently of /api/dashboard.
+@app.get("/api/mc/portfolio", response_model=McPortfolioStatus)
+async def get_mc_portfolio(db: Session = Depends(get_db)):
+    return _build_mc_portfolio_status(db)
+
+
+@app.get("/api/mc/signals", response_model=List[SignalResponse])
+async def get_mc_signals(limit: int = 50, db: Session = Depends(get_db)):
+    rows = (
+        db.query(Signal)
+        .filter(Signal.market_type == "monte_carlo")
+        .order_by(Signal.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    return [_db_signal_to_response(s) for s in rows]
+
+
+@app.get("/api/mc/trades", response_model=List[TradeResponse])
+async def get_mc_trades(
+    status: str = "all",  # "open" | "settled" | "all"
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    query = db.query(Trade).filter(Trade.market_type == "monte_carlo")
+    if status == "open":
+        query = query.filter(Trade.settled == False)  # noqa: E712
+    elif status == "settled":
+        query = query.filter(Trade.settled == True)  # noqa: E712
+    rows = query.order_by(Trade.timestamp.desc()).limit(limit).all()
+    return [_trade_to_response(t) for t in rows]
+
+
+# Slice D2: per-underlying views for the crypto_tech brain.
+@app.get("/api/assets/stats", response_model=List[PerAssetStats])
+async def get_per_asset_stats(db: Session = Depends(get_db)):
+    return _build_per_asset_stats(db)
+
+
+@app.get("/api/microstructure", response_model=Optional[MicrostructureResponse])
+async def get_microstructure_for_underlying(underlying: str = "BTC"):
+    """Microstructure for a single underlying. Pass ?underlying=BTC/ETH/SOL/XRP."""
+    sym = (underlying or "").upper().strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="underlying is required")
+    try:
+        micro = await compute_crypto_microstructure(sym)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        return None
+    if micro is None:
+        return None
+    return MicrostructureResponse(
+        rsi=micro.rsi,
+        momentum_1m=micro.momentum_1m,
+        momentum_5m=micro.momentum_5m,
+        momentum_15m=micro.momentum_15m,
+        vwap_deviation=micro.vwap_deviation,
+        sma_crossover=micro.sma_crossover,
+        volatility=micro.volatility,
+        price=micro.price,
+        source=micro.source,
     )
 
 

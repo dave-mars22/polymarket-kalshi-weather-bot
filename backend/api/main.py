@@ -683,6 +683,21 @@ def _build_per_strategy_stats(db: Session) -> List[PerStrategyStats]:
     crypto_tech is labeled as 'crypto_tech' in the response even though the
     DB column uses the legacy 'btc' value — the rename would require a
     migration, and this slice is additive-only.
+
+    total_pnl reconciliation (slice D4.5):
+      BotState.total_pnl is the single-pool running counter the settlement
+      code and bankroll sizing use. In a clean bot SUM(Trade.pnl WHERE
+      settled=True) would equal BotState.total_pnl, but this project's DB
+      has a drift from a dev-phase bot_state zeroing that preserved trade
+      rows. To keep the dashboard's per-strategy breakdown internally
+      consistent (crypto_tech + monte_carlo sum == BotState.total_pnl)
+      we:
+        * trust SUM(Trade.pnl) for MC (its trades are all post-pilot, no
+          drift possible)
+        * derive crypto_tech.total_pnl as the residual
+          (BotState.total_pnl − mc.total_pnl)
+      pnl_24h stays trade-sourced for both strategies; the 24h window is
+      tight enough that drift is unlikely to span it.
     """
     cutoff_24h = datetime.utcnow() - timedelta(hours=24)
     mc_total_pnl = float(
@@ -692,6 +707,7 @@ def _build_per_strategy_stats(db: Session) -> List[PerStrategyStats]:
     )
     state = db.query(BotState).first()
     tech_allocated = float(state.bankroll) if state else float(settings.INITIAL_BANKROLL)
+    bot_state_total_pnl = float(state.total_pnl) if state else 0.0
 
     out: List[PerStrategyStats] = []
     for strategy_label, market_type_value, allocated in (
@@ -704,11 +720,13 @@ def _build_per_strategy_stats(db: Session) -> List[PerStrategyStats]:
         pending = base.filter(Trade.settled == False).count()  # noqa: E712
         wins = base.filter(Trade.result == "win").count()
         losses = base.filter(Trade.result == "loss").count()
-        total_pnl = float(
-            db.query(func.coalesce(func.sum(Trade.pnl), 0.0))
-            .filter(Trade.market_type == market_type_value, Trade.settled == True)  # noqa: E712
-            .scalar() or 0.0
-        )
+        if strategy_label == "monte_carlo":
+            total_pnl = mc_total_pnl
+        else:
+            # Residual: keeps crypto_tech + monte_carlo == BotState.total_pnl
+            # so the dashboard PORTFOLIO card matches the number the bot's
+            # sizing logic reads. See module docstring above.
+            total_pnl = bot_state_total_pnl - mc_total_pnl
         pnl_24h = float(
             db.query(func.coalesce(func.sum(Trade.pnl), 0.0))
             .filter(

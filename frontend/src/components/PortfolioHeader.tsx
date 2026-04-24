@@ -7,10 +7,10 @@ import {
   getCryptoTechStats,
   getMcPilotStatus,
   getMcStats,
-  getMicrostructureFor,
   getPriceFor,
   getTotalPendingTrades,
 } from '../selectors/dashboardSelectors'
+import { formatCurrency } from '../utils'
 
 interface Props {
   data?: DashboardData
@@ -24,8 +24,7 @@ const UNDERLYINGS = ['BTC', 'ETH', 'SOL', 'XRP'] as const
 const EM_DASH = '—'
 
 function formatSpotPrice(price: number): string {
-  // Match the existing BTC tile's style: no decimals at BTC/ETH scale,
-  // 2 decimals at SOL scale, 4 decimals at XRP/sub-$10 scale.
+  // No decimals at BTC/ETH scale; 2 decimals at SOL scale; 4 at XRP scale.
   if (price >= 1000) {
     return `$${price.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
   }
@@ -35,26 +34,13 @@ function formatSpotPrice(price: number): string {
   return `$${price.toFixed(4)}`
 }
 
-function formatBankShort(value: number): string {
-  const abs = Math.abs(value)
-  if (abs >= 1000) return `$${(value / 1000).toFixed(1)}K`
-  return `$${value.toFixed(0)}`
-}
-
-function formatPnlShort(value: number): string {
-  const abs = Math.abs(value)
-  const sign = value > 0 ? '+' : value < 0 ? '-' : ''
-  if (abs >= 1000) return `${sign}$${(abs / 1000).toFixed(1)}K`
-  return `${sign}$${abs.toFixed(0)}`
-}
-
+// Slice D4.5: removed the change-% column. The previous implementation
+// extrapolated momentum_15m by ×96 into a "24h change" that was a noisy
+// directional proxy, not a real 24h number — it often showed every asset
+// down double-digits at the same time. Until the backend carries a real
+// change_24h per underlying, we just show the spot. Absent > misleading.
 function AssetTile({ data, underlying }: { data?: DashboardData; underlying: string }) {
   const price = data ? getPriceFor(data, underlying) : null
-  const micro = data ? getMicrostructureFor(data, underlying) : null
-  // Extrapolation of 15m momentum out to 24h is what the old BTC tile did.
-  // It's a proxy, not a real change_24h — but it gives directional color.
-  const change = micro ? micro.momentum_15m * 96 : null
-
   return (
     <div className="flex items-center gap-1 px-1.5">
       <span className="text-[9px] font-bold text-neutral-500 uppercase tracking-wider">
@@ -63,26 +49,36 @@ function AssetTile({ data, underlying }: { data?: DashboardData; underlying: str
       <span className="text-xs font-semibold tabular-nums text-neutral-100">
         {price != null ? formatSpotPrice(price) : EM_DASH}
       </span>
-      {change != null && (
-        <span
-          className={`text-[9px] tabular-nums ${
-            change >= 0 ? 'text-green-500' : 'text-red-500'
-          }`}
-        >
-          {change >= 0 ? '+' : ''}
-          {change.toFixed(2)}%
-        </span>
-      )}
     </div>
   )
 }
 
 function GroupLabel({ children }: { children: React.ReactNode }) {
   return (
-    <div className="text-[9px] text-neutral-500 uppercase tracking-wider leading-none mb-0.5">
+    <div className="text-[9px] text-neutral-500 uppercase tracking-wider leading-none">
       {children}
     </div>
   )
+}
+
+function BigNumber({
+  children,
+  className = '',
+}: {
+  children: React.ReactNode
+  className?: string
+}) {
+  return (
+    <div className={`text-sm font-semibold tabular-nums leading-none ${className}`}>
+      {children}
+    </div>
+  )
+}
+
+// Visible hairline pipe between secondary metrics. Matches the inline
+// "muted divider" aesthetic used elsewhere (.terminal, .scan-line etc).
+function MetricPipe() {
+  return <span className="text-neutral-700 text-[10px]">|</span>
 }
 
 function PortfolioGroup({ data }: { data?: DashboardData }) {
@@ -96,15 +92,13 @@ function PortfolioGroup({ data }: { data?: DashboardData }) {
       : 'text-red-500 glow-red'
 
   return (
-    <div className="flex flex-col justify-center min-w-0">
+    <div className="flex flex-col justify-center gap-0.5 min-w-0">
       <GroupLabel>Portfolio</GroupLabel>
-      <div className="flex items-baseline gap-1.5 leading-none">
-        <span className="text-sm font-bold tabular-nums text-neutral-100">
-          {bank != null ? formatBankShort(bank) : EM_DASH}
-        </span>
-        <span className={`text-[10px] tabular-nums ${pnlColor}`}>
-          {pnl != null ? formatPnlShort(pnl) : EM_DASH}
-        </span>
+      <BigNumber className="text-neutral-100">
+        {bank != null ? formatCurrency(bank) : EM_DASH}
+      </BigNumber>
+      <div className={`text-[10px] tabular-nums leading-none ${pnlColor}`}>
+        {pnl != null ? formatCurrency(pnl, true) : EM_DASH}
       </div>
     </div>
   )
@@ -112,9 +106,6 @@ function PortfolioGroup({ data }: { data?: DashboardData }) {
 
 function TechnicalGroup({ data }: { data?: DashboardData }) {
   const tech = data ? getCryptoTechStats(data) : null
-  // When the shared bankroll already reflects realized PnL (crypto_tech's
-  // case per D2 helper), we surface realized_bankroll + the 24h slice and
-  // cumulative win rate. Graceful '—' when per_strategy_stats is empty.
   const bank = tech?.realized_bankroll ?? null
   const pnl24 = tech?.pnl_24h ?? null
   const winRate = tech?.win_rate ?? null
@@ -136,21 +127,22 @@ function TechnicalGroup({ data }: { data?: DashboardData }) {
       : 'text-red-500'
 
   return (
-    <div className="flex flex-col justify-center min-w-0">
+    <div className="flex flex-col justify-center gap-0.5 min-w-0">
       <GroupLabel>Technical</GroupLabel>
-      <div className="flex items-baseline gap-1.5 leading-none">
-        <span className="text-sm font-semibold tabular-nums text-neutral-100">
-          {bank != null ? formatBankShort(bank) : EM_DASH}
+      <BigNumber className="text-neutral-100">
+        {bank != null ? formatCurrency(bank) : EM_DASH}
+      </BigNumber>
+      <div className="flex items-center gap-1.5 text-[10px] tabular-nums leading-none">
+        <span className={pnl24Color}>
+          24h {pnl24 != null ? formatCurrency(pnl24, true) : EM_DASH}
         </span>
-        <span className={`text-[10px] tabular-nums ${pnl24Color}`}>
-          {pnl24 != null ? formatPnlShort(pnl24) : EM_DASH}
-          <span className="text-neutral-600 ml-0.5">24h</span>
+        <MetricPipe />
+        <span className={wrColor}>
+          W {winRate != null ? `${Math.round(winRate * 100)}%` : EM_DASH}
         </span>
-        <span className={`text-[10px] tabular-nums ${wrColor}`}>
-          {winRate != null ? `${Math.round(winRate * 100)}%W` : EM_DASH}
-        </span>
-        <span className="text-[10px] tabular-nums text-neutral-600">
-          {trades != null ? `${trades}T` : EM_DASH}
+        <MetricPipe />
+        <span className="text-neutral-500">
+          N {trades != null ? trades : EM_DASH}
         </span>
       </div>
     </div>
@@ -162,9 +154,8 @@ function McGroup({ data }: { data?: DashboardData }) {
   const pilot = data ? getMcPilotStatus(data) : null
   const openCount = data?.mc_portfolio?.open_positions.length ?? 0
 
-  // IDLE state: the MC brain has never taken a trade. Show a single muted
-  // label instead of a row of zeros so it's visually distinct from a run
-  // that happens to be flat.
+  // IDLE = the MC brain has never taken a trade. Distinct from a run that
+  // happens to be flat — show a single muted label, not a row of zeros.
   const isIdle = mc != null && mc.total_trades === 0
 
   const pnlColor =
@@ -173,30 +164,28 @@ function McGroup({ data }: { data?: DashboardData }) {
       : pilot.pnl > 0
       ? 'text-green-500'
       : 'text-red-500'
+  const openColor = openCount > 0 ? 'text-amber-400' : 'text-neutral-600'
 
   return (
-    <div className="flex flex-col justify-center min-w-0">
+    <div className="flex flex-col justify-center gap-0.5 min-w-0">
       <GroupLabel>MC Pilot</GroupLabel>
       {isIdle ? (
-        <div className="text-sm font-medium text-neutral-600 tabular-nums leading-none">
-          IDLE
-        </div>
+        <BigNumber className="text-neutral-600">IDLE</BigNumber>
       ) : (
-        <div className="flex items-baseline gap-1.5 leading-none">
-          <span className="text-sm font-semibold tabular-nums text-neutral-100">
-            {pilot != null ? formatBankShort(pilot.realized) : EM_DASH}
-          </span>
-          <span className={`text-[10px] tabular-nums ${pnlColor}`}>
-            {pilot != null ? formatPnlShort(pilot.pnl) : EM_DASH}
-          </span>
-          <span
-            className={`text-[10px] uppercase tracking-wider tabular-nums ${
-              openCount > 0 ? 'text-amber-400' : 'text-neutral-600'
-            }`}
-          >
-            {openCount} Open
-          </span>
-        </div>
+        <>
+          <BigNumber className="text-neutral-100">
+            {pilot != null ? formatCurrency(pilot.realized) : EM_DASH}
+          </BigNumber>
+          <div className="flex items-center gap-1.5 text-[10px] tabular-nums leading-none">
+            <span className={pnlColor}>
+              PnL {pilot != null ? formatCurrency(pilot.pnl, true) : EM_DASH}
+            </span>
+            <MetricPipe />
+            <span className={`${openColor} uppercase tracking-wider`}>
+              {openCount} Open
+            </span>
+          </div>
+        </>
       )}
     </div>
   )
@@ -217,9 +206,6 @@ function PendingBadge({ data }: { data?: DashboardData }) {
       <span className="text-xs font-semibold tabular-nums">
         {pending != null ? pending : EM_DASH}
       </span>
-      {/* Optional per-asset stats peek: total settled across crypto_tech
-          assets — a quick sanity dot that the aggregation is alive. Keeps
-          the badge tight; no breakdown here. */}
       {data && getAllAssetStats(data).length > 0 && (
         <span className="w-1 h-1 rounded-full bg-green-500/60" />
       )}
@@ -245,7 +231,7 @@ export function PortfolioHeader({ data }: Props) {
       <div className="flex-1" />
 
       {/* Three strategy groups separated by hairline dividers. */}
-      <div className="flex items-stretch gap-2 shrink-0">
+      <div className="flex items-stretch gap-3 shrink-0">
         <PortfolioGroup data={data} />
         <div className="w-px bg-neutral-800 self-stretch" />
         <TechnicalGroup data={data} />

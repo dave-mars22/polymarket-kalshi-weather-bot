@@ -29,6 +29,7 @@ class Trade(Base):
     market_type = Column(String, default="btc", index=True)  # "btc" or "monte_carlo"
     underlying_asset = Column(String, nullable=True, index=True)  # "BTC", "SPX" for MC
     asset_class = Column(String, nullable=True, index=True)       # "crypto", "equity_index" for MC
+    contract_style = Column(String, nullable=True)                # "european" | "one_touch_above" | "one_touch_below" for MC
 
     # Trade details
     direction = Column(String)  # "up" or "down"
@@ -82,6 +83,7 @@ class Signal(Base):
     market_type = Column(String, default="btc", index=True)  # "btc" or "monte_carlo"
     underlying_asset = Column(String, nullable=True, index=True)  # "BTC", "SPX" for MC
     asset_class = Column(String, nullable=True, index=True)       # "crypto", "equity_index" for MC
+    contract_style = Column(String, nullable=True)                # "european" | "one_touch_above" | "one_touch_below" for MC
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
     direction = Column(String)
@@ -178,10 +180,11 @@ def ensure_schema():
             with conn.begin():
                 conn.execute(text("ALTER TABLE trades ADD COLUMN market_type VARCHAR DEFAULT 'btc'"))
 
-    # MC-era columns on trades: underlying_asset, asset_class
+    # MC-era columns on trades: underlying_asset, asset_class, contract_style
     for col, coltype in [
         ("underlying_asset", "VARCHAR"),
         ("asset_class", "VARCHAR"),
+        ("contract_style", "VARCHAR"),
     ]:
         if col not in columns:
             with engine.connect() as conn:
@@ -207,6 +210,7 @@ def ensure_schema():
                 ("market_type", "VARCHAR DEFAULT 'btc'"),
                 ("underlying_asset", "VARCHAR"),
                 ("asset_class", "VARCHAR"),
+                ("contract_style", "VARCHAR"),
             ]:
                 if col not in signal_columns:
                     try:

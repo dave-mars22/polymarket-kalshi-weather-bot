@@ -153,14 +153,21 @@ def calculate_pnl(trade: Trade, settlement_value: float) -> float:
 
 async def check_market_settlement(trade: Trade) -> Tuple[bool, Optional[float], Optional[float]]:
     """
-    Check if a trade's market has settled.
+    Check if a trade's market has settled. Routes by platform:
+      - Kalshi -> _fetch_kalshi_resolution (signed auth not required for public markets)
+      - Polymarket (and anything else) -> fetch_polymarket_resolution
 
     Returns: (is_settled, settlement_value, pnl)
     """
-    is_resolved, settlement_value = await fetch_polymarket_resolution(
-        trade.market_ticker,
-        event_slug=trade.event_slug
-    )
+    platform = (getattr(trade, "platform", None) or "polymarket").lower()
+
+    if platform == "kalshi":
+        is_resolved, settlement_value = await _fetch_kalshi_resolution(trade.market_ticker)
+    else:
+        is_resolved, settlement_value = await fetch_polymarket_resolution(
+            trade.market_ticker,
+            event_slug=trade.event_slug,
+        )
 
     if not is_resolved or settlement_value is None:
         return False, None, None
@@ -171,8 +178,8 @@ async def check_market_settlement(trade: Trade) -> Tuple[bool, Optional[float], 
     outcome = "UP" if settlement_value == 1.0 else "DOWN"
     result = "WIN" if mapped_dir == outcome else "LOSS"
 
-    logger.info(f"Trade {trade.id} settled: {mapped_dir} @ {trade.entry_price:.0%} -> "
-                f"{result} P&L: ${pnl:+.2f}")
+    logger.info(f"Trade {trade.id} ({platform}) settled: {mapped_dir} @ "
+                f"{trade.entry_price:.2%} -> {result} P&L: ${pnl:+.2f}")
 
     return True, settlement_value, pnl
 

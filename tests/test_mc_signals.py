@@ -406,5 +406,151 @@ class TestEquityIndexAssetClass(MCSignalsTestCase):
         self.assertEqual(signals, [])
 
 
+class TestPersistMCSignals(unittest.TestCase):
+    """persist_mc_signals writes signals to DB with MC-specific columns."""
+
+    def setUp(self):
+        # Use an in-memory SQLite DB so tests don't touch the real tradingbot.db
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from backend.models import database as db_mod
+
+        engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+        db_mod.Base.metadata.create_all(bind=engine)
+        self._orig_SessionLocal = db_mod.SessionLocal
+        self._orig_engine = db_mod.engine
+        db_mod.engine = engine
+        db_mod.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+        # Also need to repoint mc_signals' import
+        import backend.core.mc_signals as mc_mod
+        self._orig_mc_session_local = mc_mod.SessionLocal
+        mc_mod.SessionLocal = db_mod.SessionLocal
+
+    def tearDown(self):
+        from backend.models import database as db_mod
+        db_mod.SessionLocal = self._orig_SessionLocal
+        db_mod.engine = self._orig_engine
+        import backend.core.mc_signals as mc_mod
+        mc_mod.SessionLocal = self._orig_mc_session_local
+
+    def test_persists_with_mc_specific_columns(self):
+        from backend.core.mc_signals import persist_mc_signals
+        from backend.models.database import Signal, SessionLocal
+
+        close = datetime.now(timezone.utc) + timedelta(days=5)
+        market = MonteCarloMarket(
+            ticker="KXBTCMAXMON-X-T80000",
+            event_ticker="KXBTCMAXMON-X",
+            venue="kalshi",
+            underlying_asset="BTC",
+            asset_class="crypto",
+            direction="above",
+            threshold=80_000.0,
+            close_time=close,
+            yes_ask=0.50, yes_bid=0.49,
+            no_ask=0.51, no_bid=0.50,
+            raw_market={"rules_primary": "If the price of BTC is ever above $80000..."},
+            contract_style="one_touch_above",
+        )
+        sig = MonteCarloSignal(
+            market=market, direction="YES",
+            model_probability=0.63, market_probability=0.50,
+            raw_edge=0.13, net_edge=0.085, fee_cost=5.50,
+            passes_threshold=True, suggested_size=30.0,
+            reasoning="test reasoning",
+            spot_used=77_700.0, vol_used=0.45, drift_used=0.0,
+            years_to_expiry=7 / 365,
+        )
+
+        written = persist_mc_signals([sig])
+        self.assertEqual(written, 1)
+
+        with SessionLocal() as db:
+            rows = db.query(Signal).all()
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r.market_ticker, "KXBTCMAXMON-X-T80000")
+        self.assertEqual(r.market_type, "monte_carlo")
+        self.assertEqual(r.underlying_asset, "BTC")
+        self.assertEqual(r.asset_class, "crypto")
+        self.assertEqual(r.contract_style, "one_touch_above")
+        self.assertEqual(r.platform, "kalshi")
+        self.assertEqual(r.direction, "yes")
+        self.assertAlmostEqual(r.model_probability, 0.63, places=6)
+        self.assertAlmostEqual(r.edge, 0.085, places=6)
+        self.assertIn("rules:", r.reasoning)
+        self.assertIn("is ever above", r.reasoning)
+        self.assertFalse(r.executed)
+
+    def test_dedup_same_minute(self):
+        from backend.core.mc_signals import persist_mc_signals
+
+        close = datetime.now(timezone.utc) + timedelta(days=5)
+        m = MonteCarloMarket(
+            ticker="KXBTCMAXMON-X-T80000", event_ticker="KXBTCMAXMON-X",
+            venue="kalshi", underlying_asset="BTC", asset_class="crypto",
+            direction="above", threshold=80_000.0, close_time=close,
+            yes_ask=0.5, yes_bid=0.49, no_ask=0.51, no_bid=0.5,
+            raw_market={}, contract_style="one_touch_above",
+        )
+        mk_sig = lambda: MonteCarloSignal(
+            market=m, direction="YES",
+            model_probability=0.6, market_probability=0.5,
+            raw_edge=0.1, net_edge=0.05, fee_cost=5.0,
+            passes_threshold=True, suggested_size=30.0,
+            reasoning="x", spot_used=77_000.0, vol_used=0.4, drift_used=0.0,
+            years_to_expiry=0.02,
+        )
+        self.assertEqual(persist_mc_signals([mk_sig()]), 1)
+        # Same-minute re-persist should dedupe.
+        self.assertEqual(persist_mc_signals([mk_sig()]), 0)
+
+
+class TestSchedulerRegistration(unittest.TestCase):
+    """start_scheduler with MC_ENABLED True/False registers correct jobs."""
+
+    def test_mc_enabled_registers_mc_job(self):
+        import backend.core.scheduler as sched_mod
+        from backend.config import settings
+        original = settings.MC_ENABLED
+        settings.MC_ENABLED = True
+        try:
+            # Ensure no prior scheduler
+            if sched_mod.scheduler is not None:
+                sched_mod.stop_scheduler()
+            with patch.object(sched_mod, "asyncio") as mock_asyncio:
+                mock_asyncio.create_task = MagicMock()
+                sched_mod.start_scheduler()
+                try:
+                    job_ids = {j.id for j in sched_mod.scheduler.get_jobs()}
+                finally:
+                    sched_mod.stop_scheduler()
+            self.assertIn("mc_scan", job_ids)
+            self.assertIn("market_scan", job_ids)
+        finally:
+            settings.MC_ENABLED = original
+
+    def test_mc_disabled_does_not_register_mc_job(self):
+        import backend.core.scheduler as sched_mod
+        from backend.config import settings
+        original = settings.MC_ENABLED
+        settings.MC_ENABLED = False
+        try:
+            if sched_mod.scheduler is not None:
+                sched_mod.stop_scheduler()
+            with patch.object(sched_mod, "asyncio") as mock_asyncio:
+                mock_asyncio.create_task = MagicMock()
+                sched_mod.start_scheduler()
+                try:
+                    job_ids = {j.id for j in sched_mod.scheduler.get_jobs()}
+                finally:
+                    sched_mod.stop_scheduler()
+            self.assertNotIn("mc_scan", job_ids)
+            self.assertIn("market_scan", job_ids)  # BTC still registered
+        finally:
+            settings.MC_ENABLED = original
+
+
 if __name__ == "__main__":
     unittest.main()

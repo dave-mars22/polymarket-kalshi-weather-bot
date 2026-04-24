@@ -448,12 +448,27 @@ async def run_scan(db: Session = Depends(get_db)):
     signals = await scan_for_signals()
     actionable = [s for s in signals if s.passes_threshold]
 
-    return {
+    result = {
         "status": "ok",
         "total_signals": len(signals),
         "actionable_signals": len(actionable),
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+    # Also run MC scan if enabled (mirrors the BTC pattern).
+    if settings.MC_ENABLED:
+        try:
+            from backend.core.mc_signals import scan_for_mc_signals
+            mc_signals = scan_for_mc_signals()
+            mc_act = [s for s in mc_signals if s.passes_threshold]
+            result["mc_signals"] = len(mc_signals)
+            result["mc_actionable"] = len(mc_act)
+        except Exception as e:
+            log_event("warning", f"[MC] manual scan failed: {e}")
+            result["mc_signals"] = 0
+            result["mc_actionable"] = 0
+
+    return result
 
 
 @app.post("/api/settle-trades")

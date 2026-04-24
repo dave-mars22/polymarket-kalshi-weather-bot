@@ -1,5 +1,16 @@
 """Monte Carlo signal generator.
 
+PILOT PHASE (Slice 1f):
+    This MC brain is in pilot. Stopping criterion: after 90 days OR 30
+    settled barrier trades (whichever comes first), if realized edge
+    averages below 3pp, archive the brain. Do not expand to additional
+    underlyings or contract types before this validation.
+
+    Pilot bankroll: settings.MC_PILOT_BANKROLL_USD ($1000). This is
+    intentionally small to cap downside while we learn whether our
+    barrier pricing actually predicts resolutions better than Kalshi's
+    market makers.
+
 Ties market discovery + GBM simulation + vol/drift estimation + fee math +
 calibration + bankroll-relative sizing into MonteCarloSignal objects the
 scheduler can act on.
@@ -42,7 +53,7 @@ from backend.data.price_history import (
     fetch_daily_closes,
 )
 from backend.data.spot_prices import SpotPriceError, fetch_spot
-from backend.models.database import BotState, SessionLocal, Trade
+from backend.models.database import Signal, SessionLocal, Trade
 
 logger = logging.getLogger("trading_bot")
 
@@ -462,12 +473,89 @@ def _build_reasoning(
 # Allocation state (DB read)
 # -------------------------------------------------------------------------
 
+def persist_mc_signals(signals: List[MonteCarloSignal]) -> int:
+    """Persist MC signals (actionable AND sub-threshold) to the Signal table.
+
+    Every signal is saved so calibration can track realized-vs-predicted
+    edge. Deduplicated on (market_ticker, floor(now to minute)) so multiple
+    scans in the same minute don't re-persist identical rows.
+
+    Returns number of new rows written.
+    """
+    if not signals:
+        return 0
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    minute_ts = now.replace(second=0, microsecond=0)
+
+    db = SessionLocal()
+    written = 0
+    try:
+        for s in signals:
+            existing = db.query(Signal).filter(
+                Signal.market_ticker == s.market.ticker,
+                Signal.market_type == "monte_carlo",
+                Signal.timestamp >= minute_ts,
+            ).first()
+            if existing is not None:
+                continue
+
+            # Append contract-resolution rules excerpt to reasoning for
+            # post-hoc auditing. raw_market["rules_primary"] can be long;
+            # keep first 240 chars.
+            rules_excerpt = (s.market.raw_market or {}).get("rules_primary", "") or ""
+            rules_excerpt = rules_excerpt.strip().replace("\n", " ")[:240]
+            reasoning_with_rules = f"{s.reasoning} | rules: {rules_excerpt}"
+
+            bankroll_for_kelly = settings.MC_PILOT_BANKROLL_USD
+            kelly_fraction = (
+                s.suggested_size / bankroll_for_kelly if bankroll_for_kelly > 0 else 0.0
+            )
+
+            db_sig = Signal(
+                market_ticker=s.market.ticker,
+                platform=s.market.venue,
+                market_type="monte_carlo",
+                underlying_asset=s.market.underlying_asset,
+                asset_class=s.market.asset_class,
+                contract_style=s.market.contract_style,
+                timestamp=now,
+                direction=s.direction.lower(),  # "yes" / "no" to match DB convention
+                model_probability=s.model_probability,
+                market_price=s.market_probability,
+                edge=s.net_edge,
+                confidence=0.0,  # MC brain doesn't compute a separate confidence
+                kelly_fraction=kelly_fraction,
+                suggested_size=s.suggested_size,
+                sources=[f"gbm_{s.market.contract_style}"],
+                reasoning=reasoning_with_rules,
+                executed=False,
+            )
+            db.add(db_sig)
+            written += 1
+
+        db.commit()
+    except Exception as e:
+        logger.warning(f"persist_mc_signals failed: {e}")
+        db.rollback()
+        written = 0
+    finally:
+        db.close()
+
+    return written
+
+
 def _get_allocation_state() -> _AllocationState:
-    """Snapshot current bankroll + outstanding MC allocations from the DB."""
+    """Snapshot current bankroll + outstanding MC allocations from the DB.
+
+    Bankroll for MC sizing is MC_PILOT_BANKROLL_USD (currently $1000), NOT
+    the full BotState.bankroll. This isolates MC sizing decisions from BTC
+    brain activity during the pilot; total drawdown is capped at ~$1000
+    even if BTC accounting grows the total bankroll.
+    """
     db = SessionLocal()
     try:
-        state = db.query(BotState).first()
-        bankroll = float(state.bankroll) if state else float(settings.INITIAL_BANKROLL)
+        bankroll = float(settings.MC_PILOT_BANKROLL_USD)
 
         base_filter = [
             Trade.settled == False,

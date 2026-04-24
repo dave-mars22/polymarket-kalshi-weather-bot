@@ -75,6 +75,7 @@ class Settings(BaseSettings):
     MC_SPOT_CACHE_SECONDS: int = 30           # 30 s — fresh enough for daily markets
     MC_MAX_TIME_TO_EXPIRY_DAYS: float = 30.0  # skip contracts expiring beyond 30 days
     MC_ENABLED: bool = True
+    MC_SCAN_INTERVAL_SECONDS: int = 600       # 10 min — MC markets don't need sub-minute scans
     # Simulation
     MC_NUM_PATHS: int = 10_000
     MC_VOL_LOOKBACK_DAYS: int = 30
@@ -92,6 +93,17 @@ class Settings(BaseSettings):
     MC_MAX_ASSET_CLASS_PCT: float = 0.15
     MC_MAX_TOTAL_ALLOCATION_PCT: float = 0.40
     MC_MAX_TRADES_PER_SCAN: int = 5
+    # Pilot-phase bankroll for MC brain. Kept at $1000 until calibration
+    # data validates realized-vs-predicted edge. DO NOT CHANGE without
+    # reviewing at least 30 settled barrier trades.
+    # Stopping criterion: after 90 days OR 30 settled barrier trades
+    # (whichever first), if realized edge averages below 3pp, archive MC.
+    MC_PILOT_BANKROLL_USD: float = 1000.0
+    # Quote-refresh guard: skip a trade if the ask price has moved more
+    # than this many dollars from the scan-time snapshot.
+    MC_QUOTE_DRIFT_TOLERANCE: float = 0.02
+    # Concentration cap: max open MC positions per Kalshi series_ticker.
+    MC_MAX_OPEN_PER_SERIES: int = 2
 
     class Config:
         env_file = ".env"

@@ -8,7 +8,7 @@ from sqlalchemy import func
 import logging
 
 from backend.config import settings
-from backend.models.database import SessionLocal, Trade, BotState, Signal
+from backend.models.database import BotState, SessionLocal, Signal, Trade
 from backend.core.signals import scan_for_signals
 
 logging.basicConfig(level=logging.INFO)
@@ -183,6 +183,171 @@ async def scan_and_trade_job():
         logger.exception("Error in scan_and_trade_job")
 
 
+async def mc_scan_and_trade_job():
+    """MC brain scan + execute loop. Runs every MC_SCAN_INTERVAL_SECONDS.
+
+    Flow:
+      1. scan_for_mc_signals() -> all signals (actionable + sub-threshold)
+      2. Persist ALL signals to Signal table (calibration tracking)
+      3. For each actionable signal (up to MC_MAX_TRADES_PER_SCAN):
+           a. Per-series concentration cap check
+           b. Quote refresh (skip if ask drifted > MC_QUOTE_DRIFT_TOLERANCE)
+           c. Create Trade row, link to Signal
+      4. Log [MC]-prefixed events via existing log_event helper
+    """
+    if not settings.MC_ENABLED:
+        return
+
+    log_event("info", "[MC] Scanning Monte Carlo markets...")
+
+    try:
+        from backend.core.mc_signals import scan_for_mc_signals, persist_mc_signals
+        from backend.core.mc_execution import (
+            concentration_cap_exceeded,
+            fetch_current_ask,
+            quote_drifted,
+            series_ticker_of,
+        )
+
+        signals = scan_for_mc_signals()
+        actionable = [s for s in signals if s.passes_threshold]
+        log_event("data", f"[MC] scan: {len(signals)} signals, {len(actionable)} actionable", {
+            "total": len(signals),
+            "actionable": len(actionable),
+        })
+
+        # Persist every signal (actionable + sub-threshold) for calibration.
+        try:
+            written = persist_mc_signals(signals)
+            if written:
+                log_event("data", f"[MC] persisted {written} new signal rows")
+        except Exception as e:
+            log_event("warning", f"[MC] persist failed: {e}")
+
+        if not actionable:
+            log_event("info", "[MC] No actionable signals to execute")
+            return
+
+        db = SessionLocal()
+        try:
+            state = db.query(BotState).first()
+            if not state:
+                log_event("error", "[MC] Bot state not initialized")
+                return
+            if not state.is_running:
+                log_event("info", "[MC] Bot paused, skipping execution")
+                return
+
+            trades_executed = 0
+            for signal in actionable[: settings.MC_MAX_TRADES_PER_SCAN]:
+                ticker = signal.market.ticker
+
+                # Guard 1: per-series concentration
+                if concentration_cap_exceeded(db, ticker):
+                    series = series_ticker_of(ticker)
+                    log_event(
+                        "info",
+                        f"[MC] skip {ticker}: concentration cap in series {series} "
+                        f"(>= {settings.MC_MAX_OPEN_PER_SERIES} open)",
+                    )
+                    continue
+
+                # Guard 2: quote refresh
+                current_ask = fetch_current_ask(ticker, signal.direction)
+                if current_ask is None:
+                    log_event(
+                        "info",
+                        f"[MC] skip {ticker}: quote refresh failed (no current ask)",
+                    )
+                    continue
+                if quote_drifted(signal.market_probability, current_ask):
+                    log_event(
+                        "info",
+                        f"[MC] skip {ticker}: quote drifted "
+                        f"{signal.market_probability:.2%} -> {current_ask:.2%} "
+                        f"(> {settings.MC_QUOTE_DRIFT_TOLERANCE:.2%})",
+                    )
+                    continue
+
+                # Guard 3: dedup against any existing open trade on same ticker
+                existing = db.query(Trade).filter(
+                    Trade.market_ticker == ticker,
+                    Trade.settled == False,  # noqa: E712
+                ).first()
+                if existing:
+                    continue
+
+                # Create the trade. Use refreshed ask as the fill price.
+                size = min(signal.suggested_size,
+                           settings.MC_MAX_TRADE_SIZE_PCT * settings.MC_PILOT_BANKROLL_USD)
+                if size < 1.0:
+                    log_event("info", f"[MC] skip {ticker}: size ${size:.2f} below $1 floor")
+                    continue
+
+                trade = Trade(
+                    market_ticker=ticker,
+                    platform=signal.market.venue,
+                    event_slug=signal.market.event_ticker,
+                    market_type="monte_carlo",
+                    underlying_asset=signal.market.underlying_asset,
+                    asset_class=signal.market.asset_class,
+                    contract_style=signal.market.contract_style,
+                    direction=signal.direction.lower(),  # "yes" / "no"
+                    entry_price=current_ask,  # the refreshed price we'd pay
+                    size=size,
+                    model_probability=signal.model_probability,
+                    market_price_at_entry=current_ask,
+                    edge_at_entry=signal.net_edge,
+                )
+                db.add(trade)
+                db.flush()
+
+                # Link to the most recent matching Signal row (if any).
+                linked = (
+                    db.query(Signal)
+                    .filter(
+                        Signal.market_ticker == ticker,
+                        Signal.market_type == "monte_carlo",
+                        Signal.executed == False,  # noqa: E712
+                    )
+                    .order_by(Signal.timestamp.desc())
+                    .first()
+                )
+                if linked:
+                    linked.executed = True
+                    trade.signal_id = linked.id
+
+                state.total_trades += 1
+                trades_executed += 1
+                log_event(
+                    "trade",
+                    f"[MC] {ticker} {signal.direction} ${size:.2f} @ {current_ask:.2%} "
+                    f"(net_edge {signal.net_edge:+.2%})",
+                    {
+                        "ticker": ticker,
+                        "side": signal.direction,
+                        "size": size,
+                        "ask": current_ask,
+                        "net_edge": signal.net_edge,
+                        "contract_style": signal.market.contract_style,
+                    },
+                )
+
+            state.last_run = datetime.utcnow()
+            db.commit()
+
+            if trades_executed:
+                log_event("success", f"[MC] executed {trades_executed} trade(s)")
+            else:
+                log_event("info", "[MC] no trades executed this cycle")
+        finally:
+            db.close()
+
+    except Exception as e:
+        log_event("error", f"[MC] scan error: {str(e)}")
+        logger.exception("Error in mc_scan_and_trade_job")
+
+
 async def settlement_job():
     """
     Background job: Check and settle pending trades.
@@ -297,14 +462,33 @@ def start_scheduler():
         max_instances=1
     )
 
+    # MC brain job: runs independently on MC_SCAN_INTERVAL_SECONDS.
+    # Gated by settings.MC_ENABLED; does nothing if disabled.
+    if settings.MC_ENABLED:
+        mc_interval = settings.MC_SCAN_INTERVAL_SECONDS
+        scheduler.add_job(
+            mc_scan_and_trade_job,
+            IntervalTrigger(seconds=mc_interval),
+            id="mc_scan",
+            replace_existing=True,
+            max_instances=1,
+        )
+
     scheduler.start()
-    log_event("success", "BTC 5-min trading scheduler started", {
-        "scan_interval": f"{scan_seconds}s",
+    log_event("success", "trading scheduler started", {
+        "btc_scan_interval": f"{scan_seconds}s",
         "settlement_interval": f"{settle_seconds}s",
-        "min_edge": f"{settings.MIN_EDGE_THRESHOLD:.0%}",
+        "btc_min_edge": f"{settings.MIN_EDGE_THRESHOLD:.0%}",
+        "mc_enabled": settings.MC_ENABLED,
+        "mc_scan_interval": (
+            f"{settings.MC_SCAN_INTERVAL_SECONDS}s"
+            if settings.MC_ENABLED else "disabled"
+        ),
     })
 
     asyncio.create_task(scan_and_trade_job())
+    if settings.MC_ENABLED:
+        asyncio.create_task(mc_scan_and_trade_job())
 
 
 def stop_scheduler():

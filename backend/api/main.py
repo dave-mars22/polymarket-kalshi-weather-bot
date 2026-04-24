@@ -1239,8 +1239,36 @@ async def get_dashboard(db: Session = Depends(get_db)):
     except Exception:
         pass
 
-    # Recent trades
-    trades = db.query(Trade).order_by(Trade.timestamp.desc()).limit(50).all()
+    # Recent trades.
+    #
+    # Slice D7.5: the top-50-by-timestamp slice is still the core of this
+    # list — that's what keeps crypto_tech recency front and center. But
+    # MC barrier trades are infrequent (pilot scale: 0-5 open at a time)
+    # and aged-in: placed now, resolved many hours or days later. In a
+    # busy BTC-tech session the two open MC rows get pushed out of the
+    # top-50 slice within an hour, which hides them from the unified
+    # Trades table entirely even though they're the strategy's *current*
+    # live state. We union in every open MC trade (capped at 20 as a
+    # safety rail against runaway opens) and dedupe by id. Settled MC
+    # trades fall back to normal aging — once resolved, they're history.
+    _MC_OPEN_SAFETY_CAP = 20
+    top_recent = db.query(Trade).order_by(Trade.timestamp.desc()).limit(50).all()
+    open_mc = (
+        db.query(Trade)
+        .filter(
+            Trade.market_type == "monte_carlo",
+            Trade.settled == False,  # noqa: E712
+        )
+        .order_by(Trade.timestamp.desc())
+        .limit(_MC_OPEN_SAFETY_CAP)
+        .all()
+    )
+    trades_by_id = {t.id: t for t in top_recent}
+    for mc_trade in open_mc:
+        trades_by_id.setdefault(mc_trade.id, mc_trade)
+    trades = sorted(
+        trades_by_id.values(), key=lambda t: t.timestamp, reverse=True,
+    )
     recent_trades = [_trade_to_response(t) for t in trades]
 
     # Equity curve

@@ -328,6 +328,144 @@ class TestApiExpansion(unittest.TestCase):
         self.assertEqual(len(r_open), 1)
         self.assertEqual(len(r_settled), 0)
 
+    # --- Slice D7.5: open MC trades must stay visible in recent_trades ----
+
+    @_patch_network
+    def test_dashboard_always_includes_open_mc_trades(self, *_mocks):
+        """Open MC trades older than the top-50 crypto_tech window must
+        still appear in /api/dashboard.recent_trades. Settled MC trades
+        follow the normal aging rules."""
+        db = self.SessionLocal()
+        try:
+            # 60 recent BTC-tech trades. Spread over the last hour so the
+            # newest 50 would naturally push anything older out.
+            now = datetime.utcnow()
+            for i in range(60):
+                db.add(Trade(
+                    market_ticker=f"btc-5m-{i}",
+                    platform="polymarket",
+                    event_slug=f"btc-updown-5m-{i}",
+                    market_type="btc",
+                    underlying_asset="BTC",
+                    asset_class="crypto",
+                    direction="up",
+                    entry_price=0.5,
+                    size=5.0,
+                    timestamp=now - timedelta(minutes=i),  # newest at i=0
+                    settled=False,
+                    result="pending",
+                    model_probability=0.55,
+                    market_price_at_entry=0.50,
+                    edge_at_entry=0.05,
+                ))
+            # Two open MC trades, a week old — would age out of any top-50
+            # slice under normal ordering.
+            week_ago = now - timedelta(days=7)
+            for i, strike in enumerate([8000000, 8250000]):
+                db.add(Trade(
+                    market_ticker=f"KXBTCMAXMON-BTC-26APR30-{strike}",
+                    platform="kalshi",
+                    event_slug="KXBTCMAXMON-26APR30",
+                    market_type="monte_carlo",
+                    underlying_asset="BTC",
+                    asset_class="crypto",
+                    contract_style="one_touch_above",
+                    direction="yes",
+                    entry_price=0.19 + i * 0.1,
+                    size=10.0,
+                    timestamp=week_ago - timedelta(minutes=i),
+                    settled=False,
+                    result="pending",
+                    model_probability=0.35 + i * 0.1,
+                    market_price_at_entry=0.19 + i * 0.1,
+                    edge_at_entry=0.06,
+                ))
+            db.commit()
+        finally:
+            db.close()
+
+        r = self.client.get("/api/dashboard")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        recent = body["recent_trades"]
+
+        # Union of top-50 + open MC → 52 rows (no overlap since MC is
+        # a week older than any BTC row).
+        self.assertEqual(len(recent), 52)
+
+        mc_rows = [t for t in recent if t["market_type"] == "monte_carlo"]
+        self.assertEqual(len(mc_rows), 2, "both open MC trades must be pinned")
+        mc_tickers = {t["market_ticker"] for t in mc_rows}
+        self.assertEqual(mc_tickers, {
+            "KXBTCMAXMON-BTC-26APR30-8000000",
+            "KXBTCMAXMON-BTC-26APR30-8250000",
+        })
+
+        # Sanity: non-MC slice is still capped at 50.
+        non_mc = [t for t in recent if t["market_type"] != "monte_carlo"]
+        self.assertEqual(len(non_mc), 50)
+
+        # Sanity: sort is preserved — timestamps must be non-increasing.
+        ts = [t["timestamp"] for t in recent]
+        self.assertEqual(ts, sorted(ts, reverse=True))
+
+    @_patch_network
+    def test_dashboard_does_not_duplicate_mc_trades_already_in_top50(
+        self, *_mocks,
+    ):
+        """If an open MC trade is already among the 50 most recent, the
+        union must not double-include it (dedupe by id)."""
+        db = self.SessionLocal()
+        try:
+            now = datetime.utcnow()
+            # 5 recent MC trades + 10 recent BTC trades, all within the
+            # last 15 minutes. Both MC rows are already in the top-50.
+            for i in range(10):
+                db.add(Trade(
+                    market_ticker=f"btc-5m-{i}",
+                    platform="polymarket",
+                    event_slug=f"btc-updown-5m-{i}",
+                    market_type="btc",
+                    underlying_asset="BTC",
+                    asset_class="crypto",
+                    direction="up",
+                    entry_price=0.5,
+                    size=5.0,
+                    timestamp=now - timedelta(seconds=i),
+                    settled=False,
+                    result="pending",
+                    model_probability=0.55,
+                    market_price_at_entry=0.50,
+                    edge_at_entry=0.05,
+                ))
+            for i in range(5):
+                db.add(Trade(
+                    market_ticker=f"KXBTCMAXMON-MC-{i}",
+                    platform="kalshi",
+                    market_type="monte_carlo",
+                    underlying_asset="BTC",
+                    asset_class="crypto",
+                    contract_style="one_touch_above",
+                    direction="yes",
+                    entry_price=0.2,
+                    size=10.0,
+                    timestamp=now - timedelta(seconds=i + 100),
+                    settled=False,
+                    result="pending",
+                    model_probability=0.35,
+                    market_price_at_entry=0.2,
+                    edge_at_entry=0.06,
+                ))
+            db.commit()
+        finally:
+            db.close()
+
+        recent = self.client.get("/api/dashboard").json()["recent_trades"]
+        # 10 BTC + 5 MC = 15, no dedupe needed, no overflow.
+        self.assertEqual(len(recent), 15)
+        ids = [t["id"] for t in recent]
+        self.assertEqual(len(ids), len(set(ids)), "no duplicate trade ids")
+
 
 class TestKalshiSettlementParser(unittest.TestCase):
     def test_parses_yymmmdd_from_ticker(self):

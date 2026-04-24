@@ -299,6 +299,56 @@ class TestAllocationCaps(MCSignalsTestCase):
         self.assertLessEqual(signals[0].suggested_size, 1.0 + 1e-9)
 
 
+class TestBetweenMarket(MCSignalsTestCase):
+    """Between markets use prob_in_range(low, high) for the YES side."""
+
+    def test_between_uses_prob_in_range(self):
+        import numpy as np
+        from backend.core.monte_carlo import SimulationResult
+
+        close = datetime.now(timezone.utc) + timedelta(days=5)
+        m = MonteCarloMarket(
+            ticker="KXINX-BETWEEN",
+            event_ticker="KXINX-BETWEEN",
+            venue="kalshi",
+            underlying_asset="SPX",
+            asset_class="equity_index",
+            direction="between",
+            threshold=5800.0,
+            threshold_upper=5900.0,
+            close_time=close,
+            yes_ask=0.30,
+            yes_bid=0.28,
+            no_ask=0.72,
+            no_bid=0.70,
+            raw_market={},
+        )
+
+        # Build a sim where prob_in_range(5800, 5900) = 0.50.
+        # Half of paths at 5850 (inside), half at 5700 (below).
+        n = 10_000
+        terminal = np.concatenate([
+            np.full(n // 2, 5850.0),
+            np.full(n // 2, 5700.0),
+        ])
+        sim = SimulationResult(
+            spot=5800.0, drift=0.0, vol=0.18, years_to_expiry=5 / 365,
+            n_paths=n, terminal_prices=terminal,
+        )
+
+        with self._patches(markets=[m], sim=sim, spot_price=5800.0)[0]:
+            signals = scan_for_mc_signals()
+
+        self.assertEqual(len(signals), 1)
+        s = signals[0]
+        # model_p_yes = prob_in_range(5800, 5900) = 0.50; yes_ask = 0.30 => raw = +0.20.
+        # Should pick YES side.
+        self.assertEqual(s.direction, "YES")
+        self.assertAlmostEqual(s.model_probability, 0.50, places=4)
+        self.assertIn("between", s.reasoning)
+        self.assertIn("[$5,800.00, $5,900.00]", s.reasoning)
+
+
 class TestEquityIndexAssetClass(MCSignalsTestCase):
     """SPX/NDX go through the same signal generator path, just with a
     different underlying symbol + periods_per_year (252 trading days)."""

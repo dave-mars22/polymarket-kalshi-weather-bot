@@ -34,11 +34,16 @@ KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 # GBM's constant-vol assumption (long horizons) or overwhelm our scan
 # cadence (short horizons).
 KALSHI_CRYPTO_SERIES: List[Tuple[str, str, str]] = [
-    ("KXBTCD",    "BTC",  "crypto"),
-    ("KXBCH",     "BCH",  "crypto"),
-    ("KXSHIBA",   "SHIB", "crypto"),
-    ("KXAVAXD",   "AVAX", "crypto"),
-    ("KXBTCMAXD", "BTC",  "crypto"),
+    # Daily
+    ("KXBTCD",      "BTC",  "crypto"),
+    ("KXBCH",       "BCH",  "crypto"),
+    ("KXSHIBA",     "SHIB", "crypto"),
+    ("KXAVAXD",     "AVAX", "crypto"),
+    ("KXBTCMAXD",   "BTC",  "crypto"),
+    # Monthly / annual (Slice 2.5 experiment)
+    ("KXBTCMINMON", "BTC",  "crypto"),
+    ("KXBTCMAXMON", "BTC",  "crypto"),
+    ("KXBTCY",      "BTC",  "crypto"),
 ]
 
 # SPX and NDX each expose a mix of legacy and KX-prefixed series that often
@@ -53,12 +58,19 @@ KALSHI_EQUITY_INDEX_SERIES: List[Tuple[str, str, str]] = [
     ("KXINX",     "SPX", "equity_index"),
     ("KXINXZ",    "SPX", "equity_index"),
     ("KXINXAB",   "SPX", "equity_index"),
+    # SPX weekly / monthly (Slice 2.5 experiment)
+    ("KXINXW",    "SPX", "equity_index"),
+    ("KXINXM",    "SPX", "equity_index"),
     # NDX daily
-    ("NASDAQ100",  "NDX", "equity_index"),
-    ("NASDAQ100U", "NDX", "equity_index"),
-    ("NASDAQ100Z", "NDX", "equity_index"),
-    ("KXNASDAQ100",  "NDX", "equity_index"),
-    ("KXNASDAQ100Z", "NDX", "equity_index"),
+    ("NASDAQ100",     "NDX", "equity_index"),
+    ("NASDAQ100U",    "NDX", "equity_index"),
+    ("NASDAQ100Z",    "NDX", "equity_index"),
+    ("KXNASDAQ100",   "NDX", "equity_index"),
+    ("KXNASDAQ100Z",  "NDX", "equity_index"),
+    # NDX weekly / monthly / annual (Slice 2.5 experiment)
+    ("KXNASDAQ100W",  "NDX", "equity_index"),
+    ("NASDAQ100M",    "NDX", "equity_index"),
+    ("NASDAQ100Y",    "NDX", "equity_index"),
 ]
 
 # Combined set — fetch_mc_markets iterates and filters by asset_class arg.
@@ -71,20 +83,81 @@ _KALSHI_PAGE_LIMIT = 200
 
 @dataclass(frozen=True)
 class MonteCarloMarket:
-    """A binary contract we can price with GBM."""
+    """A binary contract we can price with GBM.
+
+    contract_style:
+      - "european":        YES resolves on terminal value (S_T vs threshold).
+      - "one_touch_above": YES resolves if S EVER reaches threshold from below
+                           at any point in [issuance, expiry]. Requires barrier
+                           math (reflection-principle closed-form), not
+                           European pricing — GBM terminal probability
+                           systematically UNDER-estimates hit probability.
+      - "one_touch_below": symmetric downside barrier.
+
+    Default is "european". If rules_primary text can't be confidently
+    classified as a barrier contract, we stay european to avoid mispricing.
+    """
     ticker: str
     event_ticker: str
-    venue: str              # "kalshi" or "polymarket"
-    underlying_asset: str   # e.g. "BTC"
-    asset_class: str        # e.g. "crypto"
-    direction: str          # "above" or "below"
+    venue: str                  # "kalshi" or "polymarket"
+    underlying_asset: str       # e.g. "BTC"
+    asset_class: str            # e.g. "crypto"
+    direction: str              # "above" | "below" | "between"
     threshold: float
-    close_time: datetime    # UTC
-    yes_ask: float          # 0..1
+    close_time: datetime        # UTC
+    yes_ask: float              # 0..1
     yes_bid: float
     no_ask: float
     no_bid: float
-    raw_market: dict        # full API response, for debugging
+    raw_market: dict            # full API response, for debugging
+    threshold_upper: Optional[float] = None  # only set for direction == "between"
+    contract_style: str = "european"
+
+
+# Barrier-language patterns. Order matters: we check for explicit barrier
+# phrasing first. If none match, we stay "european".
+_ONE_TOUCH_ABOVE_PATTERNS = [
+    "ever above",
+    "ever reach",
+    "ever exceed",
+    "at any point above",
+    "at any time above",
+    "touches",
+    "hits",
+]
+_ONE_TOUCH_BELOW_PATTERNS = [
+    "ever below",
+    "ever drops below",
+    "ever falls below",
+    "at any point below",
+    "at any time below",
+]
+
+
+def _classify_contract_style(
+    rules_primary: Optional[str], direction: str,
+) -> str:
+    """Classify a contract as 'european', 'one_touch_above', or 'one_touch_below'.
+
+    Conservative: returns 'european' if the rules text is missing or
+    ambiguous. We prefer to skip a tradeable barrier contract than to
+    misprice a European contract as a barrier.
+    """
+    if not rules_primary or direction == "between":
+        # Between markets aren't barrier-style; they're range markets.
+        return "european"
+    text = rules_primary.lower()
+    if direction == "above":
+        for pat in _ONE_TOUCH_ABOVE_PATTERNS:
+            if pat in text:
+                return "one_touch_above"
+        return "european"
+    if direction == "below":
+        for pat in _ONE_TOUCH_BELOW_PATTERNS:
+            if pat in text:
+                return "one_touch_below"
+        return "european"
+    return "european"
 
 
 class MCMarketError(Exception):
@@ -133,7 +206,7 @@ def fetch_mc_markets(
             continue
 
         for m in series_markets:
-            key = (m.underlying_asset, m.direction, m.threshold, m.close_time)
+            key = (m.underlying_asset, m.direction, m.threshold, m.threshold_upper, m.close_time)
             if key in seen:
                 logger.debug(
                     f"Deduplicated {m.ticker} (duplicate of earlier market "
@@ -216,15 +289,25 @@ def _parse_kalshi_market(
         return None
 
     strike_type = raw.get("strike_type")
+    threshold_upper: Optional[float] = None
     if strike_type == "greater":
         direction = "above"
         threshold_raw = raw.get("floor_strike")
     elif strike_type == "less":
         direction = "below"
         threshold_raw = raw.get("cap_strike")
+    elif strike_type == "between":
+        direction = "between"
+        threshold_raw = raw.get("floor_strike")
+        upper_raw = raw.get("cap_strike")
+        if upper_raw is None:
+            return None
+        try:
+            threshold_upper = float(upper_raw)
+        except (TypeError, ValueError):
+            return None
     else:
-        # "between" would need range logic (P(L < S_T <= H)) the signal
-        # generator doesn't yet handle; unknown types are skipped defensively.
+        # Unknown strike_type: skip defensively.
         return None
 
     if threshold_raw is None:
@@ -232,6 +315,10 @@ def _parse_kalshi_market(
     try:
         threshold = float(threshold_raw)
     except (TypeError, ValueError):
+        return None
+
+    # For between markets: enforce ordering
+    if direction == "between" and threshold_upper is not None and threshold >= threshold_upper:
         return None
 
     # Prices are dollar strings like "0.0100" (1c) .. "1.0000" (100c).
@@ -247,6 +334,8 @@ def _parse_kalshi_market(
     if not ticker:
         return None
 
+    contract_style = _classify_contract_style(raw.get("rules_primary"), direction)
+
     return MonteCarloMarket(
         ticker=ticker,
         event_ticker=raw.get("event_ticker", ""),
@@ -255,12 +344,14 @@ def _parse_kalshi_market(
         asset_class=asset_class,
         direction=direction,
         threshold=threshold,
+        threshold_upper=threshold_upper,
         close_time=close_time,
         yes_ask=yes_ask,
         yes_bid=yes_bid,
         no_ask=no_ask,
         no_bid=no_bid,
         raw_market=raw,
+        contract_style=contract_style,
     )
 
 

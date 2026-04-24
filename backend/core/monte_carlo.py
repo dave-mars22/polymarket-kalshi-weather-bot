@@ -98,6 +98,122 @@ def simulate_terminal_prices(
     )
 
 
+def simulate_paths(
+    spot: float,
+    drift_annual: float,
+    vol_annual: float,
+    years_to_expiry: float,
+    n_paths: int,
+    n_steps: int,
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """Simulate n_paths full GBM price paths with n_steps time-steps.
+
+    Returns an array of shape (n_paths, n_steps + 1) where column 0 is S_0
+    and column n_steps is S_T. Intended for barrier-contract verification
+    (MC estimate of one-touch probability). Slow relative to
+    simulate_terminal_prices; don't use for production pricing.
+    """
+    if spot <= 0:
+        raise ValueError(f"spot must be > 0, got {spot}")
+    if vol_annual < 0:
+        raise ValueError(f"vol_annual must be >= 0, got {vol_annual}")
+    if years_to_expiry <= 0:
+        raise ValueError(f"years_to_expiry must be > 0, got {years_to_expiry}")
+    if n_paths < 1 or n_steps < 1:
+        raise ValueError(f"n_paths, n_steps must be >= 1")
+
+    rng = np.random.default_rng(seed)
+    dt = years_to_expiry / n_steps
+    drift_term = (drift_annual - 0.5 * vol_annual ** 2) * dt
+    diffusion_coef = vol_annual * math.sqrt(dt)
+
+    increments = drift_term + diffusion_coef * rng.standard_normal((n_paths, n_steps))
+    log_paths = np.cumsum(increments, axis=1)
+    # Prepend time-0 so column 0 is S_0.
+    log_paths = np.concatenate(
+        [np.zeros((n_paths, 1), dtype=log_paths.dtype), log_paths],
+        axis=1,
+    )
+    return spot * np.exp(log_paths)
+
+
+def prob_one_touch_above_analytic(
+    spot: float,
+    barrier: float,
+    drift_annual: float,
+    vol_annual: float,
+    years_to_expiry: float,
+) -> float:
+    """Closed-form P(max_{t in [0,T]} S_t >= B) under GBM with drift.
+
+    Reflection-principle formula (Shreve Vol II, Theorem 7.2.1):
+        mu_tilde = mu - sigma^2 / 2
+        d1 = (ln(S_0/B) + mu_tilde * T) / (sigma * sqrt(T))
+        d2 = (ln(S_0/B) - mu_tilde * T) / (sigma * sqrt(T))
+        P = Phi(d1) + (B/S_0)^(2 * mu_tilde / sigma^2) * Phi(d2)
+
+    If B <= S_0 the barrier is already touched at t=0 and P = 1.
+    """
+    if spot <= 0 or barrier <= 0:
+        raise ValueError("spot and barrier must both be > 0")
+    if vol_annual <= 0 or years_to_expiry <= 0:
+        raise ValueError("vol_annual and years_to_expiry must both be > 0")
+
+    if barrier <= spot:
+        return 1.0
+
+    mu_tilde = drift_annual - 0.5 * vol_annual ** 2
+    log_ratio = math.log(spot / barrier)        # < 0 since barrier > spot
+    sigma_root_t = vol_annual * math.sqrt(years_to_expiry)
+    d1 = (log_ratio + mu_tilde * years_to_expiry) / sigma_root_t
+    d2 = (log_ratio - mu_tilde * years_to_expiry) / sigma_root_t
+    power = 2.0 * mu_tilde / (vol_annual ** 2)
+    bs_power = (barrier / spot) ** power
+    return _phi(d1) + bs_power * _phi(d2)
+
+
+def prob_one_touch_below_analytic(
+    spot: float,
+    barrier: float,
+    drift_annual: float,
+    vol_annual: float,
+    years_to_expiry: float,
+) -> float:
+    """Closed-form P(min_{t in [0,T]} S_t <= B) under GBM with drift.
+
+    Mirror of prob_one_touch_above_analytic via the reflection of BM
+    around 0. The barrier-power prefactor is the same form; the d1/d2
+    drift signs flip:
+        d1 = (ln(B/S_0) - mu_tilde * T) / (sigma * sqrt(T))
+        d2 = (ln(B/S_0) + mu_tilde * T) / (sigma * sqrt(T))
+        P = Phi(d1) + (B/S_0)^(2 * mu_tilde / sigma^2) * Phi(d2)
+
+    If B >= S_0 the barrier is already touched at t=0 and P = 1.
+    """
+    if spot <= 0 or barrier <= 0:
+        raise ValueError("spot and barrier must both be > 0")
+    if vol_annual <= 0 or years_to_expiry <= 0:
+        raise ValueError("vol_annual and years_to_expiry must both be > 0")
+
+    if barrier >= spot:
+        return 1.0
+
+    mu_tilde = drift_annual - 0.5 * vol_annual ** 2
+    log_ratio = math.log(barrier / spot)        # < 0 since barrier < spot
+    sigma_root_t = vol_annual * math.sqrt(years_to_expiry)
+    d1 = (log_ratio - mu_tilde * years_to_expiry) / sigma_root_t
+    d2 = (log_ratio + mu_tilde * years_to_expiry) / sigma_root_t
+    power = 2.0 * mu_tilde / (vol_annual ** 2)
+    bs_power = (barrier / spot) ** power
+    return _phi(d1) + bs_power * _phi(d2)
+
+
+def _phi(x: float) -> float:
+    """Standard normal CDF."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
 def prob_above_analytic(
     spot: float,
     threshold: float,

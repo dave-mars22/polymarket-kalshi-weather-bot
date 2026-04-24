@@ -28,7 +28,12 @@ from sqlalchemy import func
 from backend.config import settings
 from backend.core.calibration import get_calibration_multiplier
 from backend.core.fees import get_fee_model
-from backend.core.monte_carlo import SimulationResult, simulate_terminal_prices
+from backend.core.monte_carlo import (
+    SimulationResult,
+    prob_one_touch_above_analytic,
+    prob_one_touch_below_analytic,
+    simulate_terminal_prices,
+)
 from backend.core.vol_estimator import estimate as estimate_vol_drift
 from backend.data.mc_markets import MonteCarloMarket, fetch_mc_markets
 from backend.data.price_history import (
@@ -237,14 +242,42 @@ def _generate_signal_for_market(
     if sim_bundle.years_to_expiry < min_years:
         return None
 
-    p_above = sim_bundle.sim.prob_above(market.threshold)
-
-    # For direction="above": YES wins iff S_T > threshold
-    # For direction="below": YES wins iff S_T < threshold
-    if market.direction == "above":
-        yes_model_p, no_model_p = p_above, 1.0 - p_above
+    # Direction and contract_style together determine YES-probability math:
+    #   european + above:   P(YES) = P(S_T > K)
+    #   european + below:   P(YES) = P(S_T < K)
+    #   european + between: P(YES) = P(K_low < S_T <= K_high)
+    #   one_touch_above:    P(YES) = P(max_{t<=T} S_t >= K)   (barrier math)
+    #   one_touch_below:    P(YES) = P(min_{t<=T} S_t <= K)   (barrier math)
+    style = market.contract_style
+    if style == "one_touch_above":
+        p = prob_one_touch_above_analytic(
+            spot=sim_bundle.spot,
+            barrier=market.threshold,
+            drift_annual=sim_bundle.drift,
+            vol_annual=sim_bundle.vol,
+            years_to_expiry=sim_bundle.years_to_expiry,
+        )
+        yes_model_p, no_model_p = p, 1.0 - p
+    elif style == "one_touch_below":
+        p = prob_one_touch_below_analytic(
+            spot=sim_bundle.spot,
+            barrier=market.threshold,
+            drift_annual=sim_bundle.drift,
+            vol_annual=sim_bundle.vol,
+            years_to_expiry=sim_bundle.years_to_expiry,
+        )
+        yes_model_p, no_model_p = p, 1.0 - p
+    elif market.direction == "above":
+        p = sim_bundle.sim.prob_above(market.threshold)
+        yes_model_p, no_model_p = p, 1.0 - p
     elif market.direction == "below":
-        yes_model_p, no_model_p = 1.0 - p_above, p_above
+        p = sim_bundle.sim.prob_above(market.threshold)
+        yes_model_p, no_model_p = 1.0 - p, p
+    elif market.direction == "between":
+        if market.threshold_upper is None:
+            return None  # defensive; parser should have enforced this
+        p = sim_bundle.sim.prob_in_range(market.threshold, market.threshold_upper)
+        yes_model_p, no_model_p = p, 1.0 - p
     else:
         return None
 
@@ -408,9 +441,14 @@ def _build_reasoning(
     ):
         drift_note = " (drift=0 forced: <7d expiry)"
     status = "ACTIONABLE" if passes else "SUB-THRESHOLD"
+    if market.direction == "between" and market.threshold_upper is not None:
+        range_str = f"in [${market.threshold:,.2f}, ${market.threshold_upper:,.2f}]"
+    else:
+        range_str = f"${market.threshold:,.2f}"
+    style_tag = f" [{market.contract_style}]" if market.contract_style != "european" else ""
     return (
-        f"[{status}] {market.underlying_asset} {market.direction} "
-        f"${market.threshold:,.2f} expires in {hours:.1f}h | "
+        f"[{status}]{style_tag} {market.underlying_asset} {market.direction} "
+        f"{range_str} expires in {hours:.1f}h | "
         f"spot=${sim_bundle.spot:,.2f} vol={sim_bundle.vol:.1%} "
         f"drift={sim_bundle.drift:+.1%}{drift_note} | "
         f"{settings.MC_NUM_PATHS:,} paths | "

@@ -190,12 +190,13 @@ class TestExpiryFilter(MCMarketsTestCase):
 
 
 class TestStrikeTypes(MCMarketsTestCase):
-    def test_between_is_skipped(self):
+    def test_greater_less_and_between_all_parse(self):
         close_time = datetime.now(timezone.utc) + timedelta(days=2)
         raw = [
             _make_market("GT", strike_type="greater", close_time=close_time),
             _make_market("LT", strike_type="less", close_time=close_time),
-            _make_market("BTW", strike_type="between", close_time=close_time),
+            _make_market("BTW", strike_type="between",
+                         floor_strike=100.0, cap_strike=200.0, close_time=close_time),
             _make_market("UNK", strike_type="unknown", close_time=close_time),
         ]
 
@@ -208,8 +209,44 @@ class TestStrikeTypes(MCMarketsTestCase):
         with self._client(handler) as client:
             result = fetch_mc_markets(["crypto"], http_client=client)
 
-        tickers = {m.ticker for m in result}
-        self.assertEqual(tickers, {"GT", "LT"})
+        by_ticker = {m.ticker: m for m in result}
+        self.assertEqual(set(by_ticker), {"GT", "LT", "BTW"})  # UNK skipped
+        self.assertEqual(by_ticker["GT"].direction, "above")
+        self.assertEqual(by_ticker["LT"].direction, "below")
+        self.assertEqual(by_ticker["BTW"].direction, "between")
+        self.assertEqual(by_ticker["BTW"].threshold, 100.0)
+        self.assertEqual(by_ticker["BTW"].threshold_upper, 200.0)
+
+    def test_between_with_missing_cap_strike_skipped(self):
+        close_time = datetime.now(timezone.utc) + timedelta(days=2)
+        # raw dict with strike_type=between but no cap_strike
+        bad = _make_market("BAD", strike_type="between", close_time=close_time)
+        bad["cap_strike"] = None
+
+        def handler(req):
+            return _response_for_series(
+                req.url.params.get("series_ticker"),
+                [bad] if req.url.params.get("series_ticker") == "KXBTCD" else [],
+            )
+
+        with self._client(handler) as client:
+            result = fetch_mc_markets(["crypto"], http_client=client)
+        self.assertEqual(result, [])
+
+    def test_between_with_inverted_strikes_skipped(self):
+        close_time = datetime.now(timezone.utc) + timedelta(days=2)
+        bad = _make_market("BAD", strike_type="between",
+                           floor_strike=200.0, cap_strike=100.0, close_time=close_time)
+
+        def handler(req):
+            return _response_for_series(
+                req.url.params.get("series_ticker"),
+                [bad] if req.url.params.get("series_ticker") == "KXBTCD" else [],
+            )
+
+        with self._client(handler) as client:
+            result = fetch_mc_markets(["crypto"], http_client=client)
+        self.assertEqual(result, [])
 
 
 class TestDeduplication(MCMarketsTestCase):
@@ -437,6 +474,119 @@ class TestEquityIndexScan(MCMarketsTestCase):
             set(seen_series),
             {t for t, _, _ in KALSHI_SERIES},
         )
+
+
+class TestContractStyleClassifier(unittest.TestCase):
+    """Parser for 'european' vs 'one_touch_above' vs 'one_touch_below'.
+
+    Conservative: anything ambiguous classifies as 'european'.
+    """
+
+    def test_european_btc_daily_terminal_close(self):
+        # Paraphrase of real Kalshi KXBTCD rules_primary text.
+        rules = (
+            "If the simple average of the sixty seconds of CF Benchmarks' BRTI "
+            "before 12 AM EST is above 80000.00 at 12 AM EST on Jan 1, 2027, "
+            "then the market resolves to Yes."
+        )
+        close = datetime.now(timezone.utc) + timedelta(days=2)
+        raw = _make_market(
+            "KXBTCD-X", strike_type="greater",
+            floor_strike=80000.0, close_time=close,
+        )
+        raw["rules_primary"] = rules
+
+        def handler(req):
+            return _response_for_series(
+                req.url.params.get("series_ticker"),
+                [raw] if req.url.params.get("series_ticker") == "KXBTCD" else [],
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result = fetch_mc_markets(["crypto"], http_client=client)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].contract_style, "european")
+
+    def test_one_touch_above_kxbtcmaxmon_style(self):
+        rules = (
+            "If the price of BTC after issuance and through 11:59 PM ET on "
+            "Apr 30, 2026 is ever above $80000.00, then the market resolves to Yes."
+        )
+        close = datetime.now(timezone.utc) + timedelta(days=5)
+        raw = _make_market(
+            "KXBTCMAXMON-X", strike_type="greater",
+            floor_strike=80000.0, close_time=close,
+        )
+        raw["rules_primary"] = rules
+
+        def handler(req):
+            return _response_for_series(
+                req.url.params.get("series_ticker"),
+                [raw] if req.url.params.get("series_ticker") == "KXBTCD" else [],
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result = fetch_mc_markets(["crypto"], http_client=client)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].contract_style, "one_touch_above")
+
+    def test_one_touch_below_kxbtcminmon_style(self):
+        rules = (
+            "If the price of BTC at any point through 11:59 PM ET on "
+            "Apr 30, 2026 is ever below $60000.00, then the market resolves to Yes."
+        )
+        close = datetime.now(timezone.utc) + timedelta(days=5)
+        raw = _make_market(
+            "KXBTCMINMON-X", strike_type="less",
+            cap_strike=60000.0, close_time=close,
+        )
+        raw["rules_primary"] = rules
+
+        def handler(req):
+            return _response_for_series(
+                req.url.params.get("series_ticker"),
+                [raw] if req.url.params.get("series_ticker") == "KXBTCD" else [],
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result = fetch_mc_markets(["crypto"], http_client=client)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].contract_style, "one_touch_below")
+
+    def test_missing_rules_primary_defaults_european(self):
+        close = datetime.now(timezone.utc) + timedelta(days=2)
+        raw = _make_market("X", strike_type="greater", close_time=close)
+        raw.pop("rules_primary", None)  # ensure absent
+
+        def handler(req):
+            return _response_for_series(
+                req.url.params.get("series_ticker"),
+                [raw] if req.url.params.get("series_ticker") == "KXBTCD" else [],
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result = fetch_mc_markets(["crypto"], http_client=client)
+        self.assertEqual(result[0].contract_style, "european")
+
+    def test_between_market_always_european(self):
+        """Between markets are range contracts, not barrier contracts."""
+        close = datetime.now(timezone.utc) + timedelta(days=2)
+        raw = _make_market(
+            "BTW", strike_type="between",
+            floor_strike=100.0, cap_strike=200.0, close_time=close,
+        )
+        # Even with barrier-like text in the rules, between => european.
+        raw["rules_primary"] = "If the price is ever above 150 at any point..."
+
+        def handler(req):
+            return _response_for_series(
+                req.url.params.get("series_ticker"),
+                [raw] if req.url.params.get("series_ticker") == "KXBTCD" else [],
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result = fetch_mc_markets(["crypto"], http_client=client)
+        self.assertEqual(result[0].contract_style, "european")
 
 
 if __name__ == "__main__":

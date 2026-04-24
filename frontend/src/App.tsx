@@ -5,6 +5,7 @@ import { runScan, simulateTrade, startBot, stopBot } from './api'
 import { useDashboard } from './hooks/useDashboard'
 import { PortfolioHeader } from './components/PortfolioHeader'
 import { StrategyCards } from './components/StrategyCards'
+import { McDetailPanel } from './components/McDetailPanel'
 import { SignalsTable } from './components/SignalsTable'
 import { TradesTable } from './components/TradesTable'
 import { EquityChart } from './components/EquityChart'
@@ -192,6 +193,16 @@ function App() {
         <StrategyCards data={data} />
       </motion.div>
 
+      {/* ===== MC DETAIL PANEL (slice D8) ===== */}
+      <motion.div
+        initial={{ opacity: 0, y: -4 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.08 }}
+        className="shrink-0 px-2 py-1.5 border-b border-neutral-800"
+      >
+        <McDetailPanel data={data} />
+      </motion.div>
+
       {/* ===== MAIN GRID ===== */}
       <div className="flex-1 min-h-0 grid grid-cols-[300px_1fr_340px] grid-rows-[1fr] gap-0">
 
@@ -313,11 +324,11 @@ function App() {
       {/* ===== FOOTER ===== */}
       <footer className="shrink-0 border-t border-neutral-800 px-3 py-0.5 flex items-center justify-between">
         <span className="text-[10px] text-neutral-700 font-mono">
-          Binance/Coinbase | Polymarket
+          Coinbase/Kraken/Binance · Polymarket · Kalshi
         </span>
         <div className="flex items-center gap-3">
           <RefreshBar interval={10000} />
-          <span className="text-[10px] text-neutral-700 font-mono">BTC 5-min</span>
+          <span className="text-[10px] text-neutral-700 font-mono">Multi-asset · 2 strategies</span>
           <div className="flex items-center gap-1">
             <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
             <span className="text-[10px] text-neutral-600 font-mono">Connected</span>

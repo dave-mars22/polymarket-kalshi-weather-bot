@@ -1,6 +1,25 @@
-# Kalshi Weather + Econ Trading Bot Architecture
+# Architecture — HISTORICAL REFERENCE
 
-## Overview
+> **STATUS: STALE (kept for historical reference).**
+>
+> This document describes the earlier "Kalshi weather + econ" bot architecture
+> that was replaced during the monte-carlo-rebuild branch in April 2026. The
+> weather pipeline, NWS/ECMWF/HRRR adapters, econ pipeline, and the city/
+> release-specific sections below are **no longer present in the codebase**.
+>
+> The current architecture is a multi-crypto 5-minute Polymarket brain plus a
+> Monte Carlo barrier pricer on Kalshi. See **README.md** for the current
+> system; code is under `backend/core/signals.py` (multi-crypto tech),
+> `backend/core/mc_signals.py` (MC barrier), and `backend/core/scheduler.py`
+> (two parallel scan loops).
+>
+> The content below is preserved unchanged from pre-rebuild so prior design
+> decisions (edge filters, concentration caps, Kelly-style sizing) remain
+> discoverable. Do not treat it as a description of the current system.
+
+---
+
+## Overview (historical)
 
 A selective trading bot that exploits pricing inefficiencies in Kalshi prediction markets by combining deterministic data pipelines with disciplined position sizing. Focuses exclusively on **weather** and **economics** contracts where free, high-quality data sources provide genuine informational edges.
 

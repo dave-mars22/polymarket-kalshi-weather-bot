@@ -139,3 +139,49 @@ export function getRecentTradesByStrategy(
   }
   return out
 }
+
+// ---------------------------------------------------------------------
+// Slice D8: MC detail panel selectors
+// ---------------------------------------------------------------------
+
+// Soonest upcoming settlement across currently-open MC positions.
+// Null when there are no open positions or no parseable timestamps.
+export function getNextMcSettlement(data: DashboardData): Date | null {
+  const opens = data.mc_portfolio?.open_positions ?? []
+  let best: Date | null = null
+  for (const pos of opens) {
+    if (!pos.expected_settlement) continue
+    const t = new Date(pos.expected_settlement)
+    if (Number.isNaN(t.getTime())) continue
+    if (best === null || t < best) best = t
+  }
+  return best
+}
+
+// Group open MC positions by series key. Kalshi tickers embed the series
+// prefix + settlement date as SERIES-UNDERLYING-YYMMMDD-STRIKE, e.g.
+// KXBTCMAXMON-BTC-26APR30-8000000. The series key we return is
+// SERIES-YYMMMDD ("KXBTCMAXMON-26APR30") — coarse enough that all
+// positions expiring on the same day under the same Kalshi series share a
+// bucket, which is what "concentration per series" means operationally.
+// Falls back to the full ticker if the pattern doesn't match (defensive:
+// future Kalshi series may not embed YYMMMDD in the same slot).
+export function getMcPositionsBySeries(
+  data: DashboardData,
+): Record<string, McOpenPosition[]> {
+  const out: Record<string, McOpenPosition[]> = {}
+  const SERIES_RE = /^([^-]+)-.*?-(\d{2}[A-Z]{3}\d{2})(?:-|$)/
+  for (const pos of data.mc_portfolio?.open_positions ?? []) {
+    const match = pos.market_ticker.match(SERIES_RE)
+    const key = match ? `${match[1]}-${match[2]}` : pos.market_ticker
+    if (!out[key]) out[key] = []
+    out[key].push(pos)
+  }
+  return out
+}
+
+// Count of settled MC trades. Derived from per_strategy_stats instead of
+// a new backend field so /api/dashboard stays shape-stable.
+export function getMcSettledCount(data: DashboardData): number {
+  return getMcStats(data)?.settled_trades ?? 0
+}

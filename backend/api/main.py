@@ -1395,10 +1395,13 @@ async def websocket_events(websocket: WebSocket):
     await ws_manager.connect(websocket)
 
     try:
+        # Slice D8: same canonical UTC-with-Z format as scheduler.log_event.
+        # The inline greeting + heartbeat dicts bypass Pydantic, so we build
+        # the timestamp manually to match the rest of the WS stream.
         await websocket.send_json({
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "type": "success",
-            "message": "Connected to BTC trading bot"
+            "message": "Connected to multi-strategy trading bot"
         })
 
         from backend.core.scheduler import get_recent_events
@@ -1418,7 +1421,7 @@ async def websocket_events(websocket: WebSocket):
 
             await websocket.send_json({
                 "type": "heartbeat",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             })
 
     except WebSocketDisconnect:

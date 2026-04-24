@@ -16,6 +16,17 @@ build/
 # Database
 *.db
 *.sqlite3
+# DB snapshots taken before overnight/rebuild runs. *.db matches the live
+# DB but not these suffixed backups; list them explicitly so git status
+# stays clean after backup runs.
+tradingbot.db.backup-*
+
+# Runtime PID files written by run.py and the caffeinate wrapper.
+*.pid
+
+# Overnight logs rotate per restart; already covered by *.log below but
+# listed here so the intent is discoverable.
+overnight-*.log
 
 # Environment
 .env

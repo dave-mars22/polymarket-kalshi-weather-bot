@@ -1,6 +1,6 @@
 """Background scheduler for BTC 5-min autonomous trading."""
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -23,9 +23,18 @@ MAX_LOG_SIZE = 200
 
 
 def log_event(event_type: str, message: str, data: dict = None):
-    """Log an event for terminal display."""
+    """Log an event for terminal display.
+
+    Slice D8 fix: timestamps use the same canonical UTC-with-Z format as
+    the REST API (per slice D6.5). The WebSocket handler in backend/api/main.py
+    sends these dicts directly via send_json, bypassing Pydantic — so
+    without fixing here, WS-delivered events would have naive ISO strings
+    and any future "time ago" display on them would drift by the viewer's
+    tz offset. The REST /api/events endpoint is unaffected (it re-parses
+    via EventResponse.timestamp: UTCDatetime).
+    """
     event = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "type": event_type,
         "message": message,
         "data": data or {}

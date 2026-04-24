@@ -18,6 +18,14 @@ BYBIT_API = "https://api.bybit.com/v5/market"
 COINBASE_API = "https://api.exchange.coinbase.com"
 KRAKEN_API = "https://api.kraken.com/0/public"
 
+# Per-exchange symbol lookup. All four underlyings pre-populated in slice 3a-2
+# so slices 3c/3d (ETH, SOL, XRP enablement) don't need to touch this file.
+# Missing entries raise ValueError rather than silently fetching the wrong asset.
+_COINBASE_PRODUCT = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD", "XRP": "XRP-USD"}
+_KRAKEN_PAIR      = {"BTC": "XBTUSD",  "ETH": "ETHUSD",  "SOL": "SOLUSD",  "XRP": "XRPUSD"}
+_BINANCE_SYMBOL   = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
+_BYBIT_SYMBOL     = _BINANCE_SYMBOL  # bybit uses the same symbol format as binance
+
 # Per-underlying kline cache. Shape:
 #   {"BTC": {"data": [...], "ts": <float>, "source": "coinbase"|...},
 #    "ETH": {...}, ...}
@@ -30,8 +38,14 @@ _CACHE_TTL = 30.0
 
 
 @dataclass
-class BtcMicrostructure:
-    """Real-time BTC technical indicators computed from 1-min candles."""
+class CryptoMicrostructure:
+    """Real-time crypto technical indicators computed from 1-min candles.
+
+    Asset-agnostic shape (RSI / momentum / VWAP / SMA / volatility are
+    computed identically regardless of the underlying). The caller passes
+    the underlying symbol into compute_crypto_microstructure() and the
+    adapter routes to the right exchange product.
+    """
     # RSI (14-period Wilder smoothing)
     rsi: float = 50.0
     # Momentum: % change over various lookbacks
@@ -51,20 +65,33 @@ class BtcMicrostructure:
     source: str = "binance"
 
 
-async def fetch_binance_klines(limit: int = 60) -> Optional[List[list]]:
-    """
-    Fetch recent 1-minute BTCUSDT candles from Binance.
-    Falls back to Bybit if Binance fails (US geo-blocking).
+async def fetch_klines(underlying: str, limit: int = 60) -> Optional[List[list]]:
+    """Fetch recent 1-minute candles for `underlying` (BTC/ETH/SOL/XRP).
 
-    Returns list of [open_time, open, high, low, close, volume, ...] or None.
+    Routes across Coinbase → Kraken → Binance → Bybit with per-exchange
+    symbol lookup. Results cached per-underlying for _CACHE_TTL seconds.
+    Returns list of [open_time_ms, open, high, low, close, volume] or None.
+
+    Raises ValueError if `underlying` has no exchange symbol registered.
     """
-    # NOTE: still hardcoded to "BTC" in 3a-1 (cache shape fix only).
-    # Slice 3a-2 takes `underlying` as a parameter and renames to fetch_klines.
-    underlying = "BTC"
+    underlying = underlying.upper()
+    # Validate mapping exists in every exchange we might hit. Rather than
+    # silently fetching the wrong asset, fail loudly on unknown symbols.
+    if underlying not in _COINBASE_PRODUCT:
+        raise ValueError(
+            f"No Coinbase product registered for underlying {underlying!r}. "
+            f"Known: {sorted(_COINBASE_PRODUCT)}"
+        )
+
     now = time.time()
     entry = _kline_cache.get(underlying)
     if entry is not None and entry.get("data") is not None and (now - entry.get("ts", 0.0)) < _CACHE_TTL:
         return entry["data"]
+
+    cb_product = _COINBASE_PRODUCT[underlying]
+    kraken_pair = _KRAKEN_PAIR.get(underlying)
+    binance_symbol = _BINANCE_SYMBOL.get(underlying)
+    bybit_symbol = _BYBIT_SYMBOL.get(underlying)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         # Try Coinbase first (US-accessible, reliable)
@@ -73,7 +100,7 @@ async def fetch_binance_klines(limit: int = 60) -> Optional[List[list]]:
             end = _dt.datetime.now(_dt.timezone.utc)
             start = end - _dt.timedelta(minutes=limit)
             resp = await client.get(
-                f"{COINBASE_API}/products/BTC-USD/candles",
+                f"{COINBASE_API}/products/{cb_product}/candles",
                 params={
                     "start": start.isoformat(),
                     "end": end.isoformat(),
@@ -91,66 +118,69 @@ async def fetch_binance_klines(limit: int = 60) -> Optional[List[list]]:
             _kline_cache[underlying] = {"data": candles, "ts": now, "source": "coinbase"}
             return candles
         except Exception as e:
-            logger.warning(f"Coinbase kline fetch failed, trying Kraken: {e}")
+            logger.warning(f"Coinbase kline fetch failed for {underlying}, trying Kraken: {e}")
 
         # Fallback 1: Kraken (US-accessible, free)
-        try:
-            resp = await client.get(
-                f"{KRAKEN_API}/OHLC",
-                params={"pair": "XBTUSD", "interval": 1},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            result = data.get("result", {})
-            ohlc_key = [k for k in result if k != "last"]
-            if ohlc_key:
-                rows = result[ohlc_key[0]]
-                rows = rows[-limit:]
-                candles = [
-                    [int(r[0]) * 1000, str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[6])]
-                    for r in rows
-                ]
-                _kline_cache[underlying] = {"data": candles, "ts": now, "source": "kraken"}
-                return candles
-        except Exception as e:
-            logger.warning(f"Kraken kline fetch failed, trying Binance: {e}")
+        if kraken_pair is not None:
+            try:
+                resp = await client.get(
+                    f"{KRAKEN_API}/OHLC",
+                    params={"pair": kraken_pair, "interval": 1},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                result = data.get("result", {})
+                ohlc_key = [k for k in result if k != "last"]
+                if ohlc_key:
+                    rows = result[ohlc_key[0]]
+                    rows = rows[-limit:]
+                    candles = [
+                        [int(r[0]) * 1000, str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[6])]
+                        for r in rows
+                    ]
+                    _kline_cache[underlying] = {"data": candles, "ts": now, "source": "kraken"}
+                    return candles
+            except Exception as e:
+                logger.warning(f"Kraken kline fetch failed for {underlying}, trying Binance: {e}")
 
         # Fallback 2: Binance (geo-blocked in US)
-        try:
-            resp = await client.get(
-                f"{BINANCE_API}/klines",
-                params={"symbol": "BTCUSDT", "interval": "1m", "limit": limit},
-            )
-            resp.raise_for_status()
-            candles = resp.json()
-            _kline_cache[underlying] = {"data": candles, "ts": now, "source": "binance"}
-            return candles
-        except Exception as e:
-            logger.warning(f"Binance kline fetch failed, trying Bybit: {e}")
+        if binance_symbol is not None:
+            try:
+                resp = await client.get(
+                    f"{BINANCE_API}/klines",
+                    params={"symbol": binance_symbol, "interval": "1m", "limit": limit},
+                )
+                resp.raise_for_status()
+                candles = resp.json()
+                _kline_cache[underlying] = {"data": candles, "ts": now, "source": "binance"}
+                return candles
+            except Exception as e:
+                logger.warning(f"Binance kline fetch failed for {underlying}, trying Bybit: {e}")
 
         # Fallback 3: Bybit
-        try:
-            resp = await client.get(
-                f"{BYBIT_API}/kline",
-                params={
-                    "category": "spot",
-                    "symbol": "BTCUSDT",
-                    "interval": "1",
-                    "limit": limit,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            rows = data.get("result", {}).get("list", [])
-            rows = list(reversed(rows))
-            candles = [
-                [int(r[0]), r[1], r[2], r[3], r[4], r[5]]
-                for r in rows
-            ]
-            _kline_cache[underlying] = {"data": candles, "ts": now, "source": "bybit"}
-            return candles
-        except Exception as e:
-            logger.error(f"All kline sources failed: {e}")
+        if bybit_symbol is not None:
+            try:
+                resp = await client.get(
+                    f"{BYBIT_API}/kline",
+                    params={
+                        "category": "spot",
+                        "symbol": bybit_symbol,
+                        "interval": "1",
+                        "limit": limit,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                rows = data.get("result", {}).get("list", [])
+                rows = list(reversed(rows))
+                candles = [
+                    [int(r[0]), r[1], r[2], r[3], r[4], r[5]]
+                    for r in rows
+                ]
+                _kline_cache[underlying] = {"data": candles, "ts": now, "source": "bybit"}
+                return candles
+            except Exception as e:
+                logger.error(f"All kline sources failed for {underlying}: {e}")
 
         return None
 
@@ -180,14 +210,18 @@ def _compute_rsi(closes: List[float], period: int = 14) -> float:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-async def compute_btc_microstructure() -> Optional[BtcMicrostructure]:
+async def compute_crypto_microstructure(
+    underlying: str,
+) -> Optional[CryptoMicrostructure]:
+    """Fetch 60 one-minute candles for `underlying` and compute indicators.
+
+    Returns CryptoMicrostructure or None on fetch failure. Indicator math
+    (RSI, momentum, VWAP, SMA, volatility) is asset-agnostic.
     """
-    Fetch 60 one-minute candles and compute all technical indicators.
-    Returns BtcMicrostructure or None on failure.
-    """
-    candles = await fetch_binance_klines(limit=60)
+    underlying = underlying.upper()
+    candles = await fetch_klines(underlying, limit=60)
     if not candles or len(candles) < 20:
-        logger.warning("Not enough candle data for microstructure")
+        logger.warning(f"Not enough candle data for {underlying} microstructure")
         return None
 
     closes = [float(c[4]) for c in candles]
@@ -240,9 +274,9 @@ async def compute_btc_microstructure() -> Optional[BtcMicrostructure]:
     else:
         volatility = 0.0
 
-    source = _kline_cache.get("BTC", {}).get("source", "unknown")
+    source = _kline_cache.get(underlying, {}).get("source", "unknown")
 
-    return BtcMicrostructure(
+    return CryptoMicrostructure(
         rsi=rsi,
         momentum_1m=momentum_1m,
         momentum_5m=momentum_5m,

@@ -1,4 +1,10 @@
-"""Signal generator for BTC 5-minute Up/Down markets."""
+"""Signal generator for crypto 5-minute Up/Down markets on Polymarket.
+
+Parameterized over `underlying` (BTC / ETH / SOL / XRP). Slice 3a-2
+refactors this module to take underlying as an argument throughout; the
+actual iteration over multiple underlyings lands in slice 3e. Until then,
+scan_for_signals() scans BTC only (behavior-identical to pre-3a-2).
+"""
 import logging
 from datetime import datetime
 from typing import Optional, List
@@ -8,8 +14,8 @@ import asyncio
 from backend.config import settings
 from backend.core.fees import net_edge
 from backend.core.calibration import get_calibration_multiplier
-from backend.data.btc_markets import BtcMarket, fetch_active_btc_markets
-from backend.data.crypto import fetch_crypto_price, compute_btc_microstructure
+from backend.data.crypto_markets import CryptoUpDownMarket, fetch_active_crypto_markets
+from backend.data.crypto import fetch_crypto_price, compute_crypto_microstructure
 from backend.models.database import SessionLocal, Signal
 
 logger = logging.getLogger("trading_bot")
@@ -17,8 +23,14 @@ logger = logging.getLogger("trading_bot")
 
 @dataclass
 class TradingSignal:
-    """A trading signal for a BTC 5-min market."""
-    market: BtcMarket
+    """A trading signal for a crypto 5-min market.
+
+    The underlying asset is identified by TradingSignal.underlying; the
+    market object is now a generic CryptoUpDownMarket (same shape
+    regardless of BTC/ETH/SOL/XRP). Field renames btc_price/btc_change_*
+    → underlying_* land in slice 3e alongside the frontend update.
+    """
+    market: CryptoUpDownMarket
 
     # Core signal data
     model_probability: float = 0.5  # Our estimated probability of UP
@@ -97,11 +109,13 @@ def calculate_kelly_size(
     return size
 
 
-async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
-    """
-    Generate a trading signal for a BTC 5-min Up/Down market.
+async def generate_crypto_tech_signal(
+    market: CryptoUpDownMarket, underlying: str,
+) -> Optional[TradingSignal]:
+    """Generate a technical signal for a crypto 5-min Up/Down market.
 
-    Gates (Change 2a — tighter):
+    Indicator math and gates are identical across underlyings — only the
+    data source varies. Gates (Change 2a — tighter):
     - Convergence: 3-of-5 indicators must agree on direction (was 2-of-4)
     - RSI neutrality filter: reject if |RSI - 50| < 5 (pure noise zone)
     - Momentum floor: at least one window must show |change| > 0.1%
@@ -109,10 +123,11 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
     - Entry price filter: only enter when price <= MAX_ENTRY_PRICE
     - Time window filter: MIN_TIME_REMAINING <= time_left <= MAX_TIME_REMAINING
     """
+    underlying = underlying.upper()
     try:
-        micro = await compute_btc_microstructure()
+        micro = await compute_crypto_microstructure(underlying)
     except Exception as e:
-        logger.warning(f"Failed to compute microstructure: {e}")
+        logger.warning(f"Failed to compute {underlying} microstructure: {e}")
         return None
 
     if not micro:
@@ -279,7 +294,7 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
 
     reasoning = (
         f"[{filter_status}]{filter_note} "
-        f"BTC ${micro.price:,.0f} | RSI:{micro.rsi:.0f} Mom1m:{micro.momentum_1m:+.3f}% "
+        f"{underlying} ${micro.price:,.0f} | RSI:{micro.rsi:.0f} Mom1m:{micro.momentum_1m:+.3f}% "
         f"Mom5m:{micro.momentum_5m:+.3f}% VWAP:{micro.vwap_deviation:+.3f}% "
         f"SMA:{micro.sma_crossover:+.4f}% Vol:{micro.volatility:.4f}% | "
         f"Composite:{composite:+.3f} -> Model UP:{model_up_prob:.0%} vs Mkt:{market_up_prob:.0%} | "
@@ -309,23 +324,30 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
 
 
 async def scan_for_signals() -> List[TradingSignal]:
-    """Scan BTC 5-min markets and generate signals."""
+    """Scan crypto 5-min markets and generate signals.
+
+    TODO(slice 3e): iterate over settings.CRYPTO_TECH_UNDERLYINGS instead
+    of hardcoding BTC. Kept BTC-only in 3a-2 so behavior is identical to
+    pre-refactor; the parameterization groundwork is in place.
+    """
     signals = []
 
     logger.info("=" * 50)
-    logger.info("BTC 5-MIN SCAN: Fetching markets from Polymarket...")
+    logger.info("CRYPTO 5-MIN SCAN: Fetching markets from Polymarket...")
 
+    # TODO(slice 3e): loop over settings.CRYPTO_TECH_UNDERLYINGS
+    underlying = "BTC"
     try:
-        markets = await fetch_active_btc_markets()
+        markets = await fetch_active_crypto_markets(underlying)
     except Exception as e:
-        logger.error(f"Failed to fetch BTC markets: {e}")
+        logger.error(f"Failed to fetch {underlying} markets: {e}")
         markets = []
 
-    logger.info(f"Found {len(markets)} active BTC 5-min markets")
+    logger.info(f"Found {len(markets)} active {underlying} 5-min markets")
 
     for market in markets:
         try:
-            signal = await generate_btc_signal(market)
+            signal = await generate_crypto_tech_signal(market, underlying)
             if signal:
                 signals.append(signal)
         except Exception as e:
@@ -397,7 +419,7 @@ async def get_actionable_signals() -> List[TradingSignal]:
 
 if __name__ == "__main__":
     async def test():
-        print("Scanning BTC 5-min markets for signals...")
+        print("Scanning crypto 5-min markets for signals...")
         signals = await scan_for_signals()
         print(f"\nFound {len(signals)} total signals")
 
@@ -406,7 +428,7 @@ if __name__ == "__main__":
 
         for signal in actionable[:5]:
             print(f"\n{signal.market.slug}")
-            print(f"  BTC: ${signal.btc_price:,.0f} ({signal.btc_change_24h:+.2f}%)")
+            print(f"  Price: ${signal.btc_price:,.0f} ({signal.btc_change_24h:+.2f}%)")
             print(f"  Model UP: {signal.model_probability:.1%} vs Market UP: {signal.market_probability:.1%}")
             print(f"  Edge: {signal.edge:+.1%} -> {signal.direction.upper()}")
             print(f"  Size: ${signal.suggested_size:.2f}")

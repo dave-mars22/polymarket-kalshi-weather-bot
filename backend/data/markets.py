@@ -1,10 +1,15 @@
-"""Market data types and fetching - simplified for BTC 5-min focus."""
+"""Market data types and fetching — crypto 5-min on Polymarket.
+
+NOTE: this module currently has no external callers and is kept only
+to avoid breaking historical imports. Flagged for removal in a later
+cleanup slice.
+"""
 import logging
 from datetime import datetime
 from typing import Optional, List
 from dataclasses import dataclass
 
-from backend.data.btc_markets import BtcMarket, fetch_active_btc_markets
+from backend.data.crypto_markets import CryptoUpDownMarket, fetch_active_crypto_markets
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +23,8 @@ class MarketData:
     category: str
     subcategory: Optional[str]
 
-    yes_price: float  # 0-1 (Up price for BTC markets)
-    no_price: float   # (Down price for BTC markets)
+    yes_price: float  # 0-1 (Up price for crypto markets)
+    no_price: float   # (Down price for crypto markets)
     volume: float
     settlement_time: Optional[datetime]
 
@@ -31,25 +36,27 @@ class MarketData:
     window_end: Optional[datetime] = None
 
 
-def btc_market_to_market_data(btc: BtcMarket) -> MarketData:
-    """Convert a BtcMarket to the generic MarketData format."""
+def crypto_market_to_market_data(
+    m: CryptoUpDownMarket, underlying: str,
+) -> MarketData:
+    """Convert a CryptoUpDownMarket to the generic MarketData format."""
     return MarketData(
         platform="polymarket",
-        ticker=btc.market_id,
-        title=f"BTC Up or Down 5m - {btc.slug}",
+        ticker=m.market_id,
+        title=f"{underlying} Up or Down 5m - {m.slug}",
         category="crypto",
-        subcategory="btc-5m",
-        yes_price=btc.up_price,
-        no_price=btc.down_price,
-        volume=btc.volume,
-        settlement_time=btc.window_end,
-        event_slug=btc.slug,
-        window_start=btc.window_start,
-        window_end=btc.window_end,
+        subcategory=f"{underlying.lower()}-5m",
+        yes_price=m.up_price,
+        no_price=m.down_price,
+        volume=m.volume,
+        settlement_time=m.window_end,
+        event_slug=m.slug,
+        window_start=m.window_start,
+        window_end=m.window_end,
     )
 
 
-async def fetch_all_markets(**kwargs) -> List[MarketData]:
-    """Fetch all markets - currently only BTC 5-min markets."""
-    btc_markets = await fetch_active_btc_markets()
-    return [btc_market_to_market_data(m) for m in btc_markets]
+async def fetch_all_markets(underlying: str = "BTC", **kwargs) -> List[MarketData]:
+    """Fetch all active 5-min crypto markets for `underlying`."""
+    markets = await fetch_active_crypto_markets(underlying)
+    return [crypto_market_to_market_data(m, underlying) for m in markets]

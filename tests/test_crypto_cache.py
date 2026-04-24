@@ -42,8 +42,8 @@ class TestKlineCachePerUnderlying(unittest.TestCase):
         self.assertEqual(crypto_mod._kline_cache["ETH"]["source"], "kraken")
 
     def test_cached_btc_fetch_does_not_touch_other_underlyings(self):
-        """When fetch_binance_klines() hits its BTC cache, any pre-existing
-        ETH cache entry remains unchanged — demonstrating that different
+        """When fetch_klines("BTC") hits its cache, any pre-existing ETH
+        cache entry remains unchanged — demonstrating that different
         underlyings don't share a cache slot."""
         btc_candles = [[1000, "60000", "60100", "59900", "60050", "100"]] * 20
         eth_candles = [[1000, "3000", "3010", "2990", "3005", "500"]] * 20
@@ -55,12 +55,13 @@ class TestKlineCachePerUnderlying(unittest.TestCase):
             "data": eth_candles, "ts": now, "source": "kraken",
         }
 
-        # fetch_binance_klines is hardcoded to BTC in 3a-1; cache-hit returns
-        # btc_candles without making any HTTP call. Use a dedicated event loop
-        # so we don't close the default loop (which APScheduler tests rely on).
+        # Slice 3a-2: fetch_klines(underlying) now takes the symbol; cache-hit
+        # on BTC returns btc_candles without making any HTTP call. Use a
+        # dedicated event loop so we don't close the default loop (which
+        # APScheduler tests rely on).
         loop = asyncio.new_event_loop()
         try:
-            result = loop.run_until_complete(crypto_mod.fetch_binance_klines())
+            result = loop.run_until_complete(crypto_mod.fetch_klines("BTC"))
         finally:
             loop.close()
         self.assertIs(result, btc_candles)

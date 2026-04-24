@@ -14,8 +14,8 @@ from backend.models.database import (
     Signal, Trade, BotState, AILog, ScanLog
 )
 from backend.core.signals import scan_for_signals, TradingSignal
-from backend.data.btc_markets import fetch_active_btc_markets, BtcMarket
-from backend.data.crypto import fetch_crypto_price, compute_btc_microstructure
+from backend.data.crypto_markets import fetch_active_crypto_markets, CryptoUpDownMarket
+from backend.data.crypto import fetch_crypto_price, compute_crypto_microstructure
 
 from pydantic import BaseModel
 
@@ -283,7 +283,7 @@ async def get_btc_price():
 async def get_btc_windows():
     """Get upcoming BTC 5-min windows with prices."""
     try:
-        markets = await fetch_active_btc_markets()
+        markets = await fetch_active_crypto_markets("BTC")
         return [
             BtcWindowResponse(
                 slug=m.slug,
@@ -684,7 +684,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
     btc_price_data = None
     micro_data = None
     try:
-        micro = await compute_btc_microstructure()
+        micro = await compute_crypto_microstructure("BTC")
         if micro:
             micro_data = MicrostructureResponse(
                 rsi=micro.rsi,
@@ -725,7 +725,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
     # Fetch windows
     windows = []
     try:
-        markets = await fetch_active_btc_markets()
+        markets = await fetch_active_crypto_markets("BTC")
         windows = [
             BtcWindowResponse(
                 slug=m.slug,

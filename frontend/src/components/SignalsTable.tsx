@@ -55,20 +55,27 @@ export function SignalsTable({ signals, onSimulateTrade, isSimulating }: Props) 
   const [expandedKey, setExpandedKey] = useState<string | null>(null)
 
   const unified: UnifiedSignal[] = useMemo(() => {
-    return signals.map(s => ({
-      key: `btc-${s.market_ticker}`,
-      ticker: s.market_ticker,
-      title: (s.event_slug || s.market_ticker).replace('btc-updown-5m-', ''),
-      platform: s.platform || 'polymarket',
-      direction: s.direction,
-      edge: s.edge,
-      modelProb: s.model_probability,
-      marketProb: s.market_probability,
-      confidence: s.confidence,
-      suggestedSize: s.suggested_size,
-      reasoning: s.reasoning,
-      actionable: s.actionable,
-    }))
+    return signals.map(s => {
+      // Use underlying_asset (slice D2) to pick the right prefix; falls
+      // back to "btc" for pre-D2 payloads so legacy signals still strip.
+      const assetPrefix = (s.underlying_asset || 'btc').toLowerCase()
+      const raw = s.event_slug || s.market_ticker
+      const title = raw.replace(`${assetPrefix}-updown-5m-`, '')
+      return {
+        key: `${assetPrefix}-${s.market_ticker}`,
+        ticker: s.market_ticker,
+        title,
+        platform: s.platform || 'polymarket',
+        direction: s.direction,
+        edge: s.edge,
+        modelProb: s.model_probability,
+        marketProb: s.market_probability,
+        confidence: s.confidence,
+        suggestedSize: s.suggested_size,
+        reasoning: s.reasoning,
+        actionable: s.actionable,
+      }
+    })
   }, [signals])
 
   const handleSort = (key: SortKey) => {

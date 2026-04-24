@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { fetchDashboard, runScan, simulateTrade, startBot, stopBot } from './api'
+import { runScan, simulateTrade, startBot, stopBot } from './api'
+import { useDashboard } from './hooks/useDashboard'
 import { StatsCards } from './components/StatsCards'
 import { SignalsTable } from './components/SignalsTable'
 import { TradesTable } from './components/TradesTable'
@@ -70,11 +71,7 @@ function RefreshBar({ interval }: { interval: number }) {
 function App() {
   const queryClient = useQueryClient()
 
-  const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['dashboard'],
-    queryFn: fetchDashboard,
-    refetchInterval: 10000,
-  })
+  const { data, isLoading, error, refetch } = useDashboard()
 
   const scanMutation = useMutation({
     mutationFn: runScan,

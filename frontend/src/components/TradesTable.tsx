@@ -139,7 +139,12 @@ export function TradesTable({ trades }: Props) {
                 </td>
                 <td className="py-1 px-1.5">
                   <span className="text-neutral-400 truncate block max-w-[100px]" title={trade.event_slug || trade.market_ticker}>
-                    {(trade.event_slug || trade.market_ticker).replace('btc-updown-5m-', '')}
+                    {(() => {
+                      // Slice D3: strip the per-asset up/down prefix using
+                      // underlying_asset. Falls back to "btc" for legacy rows.
+                      const prefix = `${(trade.underlying_asset || 'btc').toLowerCase()}-updown-5m-`
+                      return (trade.event_slug || trade.market_ticker).replace(prefix, '')
+                    })()}
                   </span>
                 </td>
                 <td className="py-1 px-1.5 text-center">

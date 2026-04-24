@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { DashboardData, Signal, Trade, BotStats, BtcPrice, BtcWindow } from './types'
+import type { DashboardData } from './types'
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
@@ -9,31 +9,6 @@ const api = axios.create({
 
 export async function fetchDashboard(): Promise<DashboardData> {
   const { data } = await api.get<DashboardData>('/dashboard')
-  return data
-}
-
-export async function fetchSignals(): Promise<Signal[]> {
-  const { data } = await api.get<Signal[]>('/signals')
-  return data
-}
-
-export async function fetchBtcPrice(): Promise<BtcPrice | null> {
-  const { data } = await api.get<BtcPrice | null>('/btc/price')
-  return data
-}
-
-export async function fetchBtcWindows(): Promise<BtcWindow[]> {
-  const { data } = await api.get<BtcWindow[]>('/btc/windows')
-  return data
-}
-
-export async function fetchTrades(): Promise<Trade[]> {
-  const { data } = await api.get<Trade[]>('/trades')
-  return data
-}
-
-export async function fetchStats(): Promise<BotStats> {
-  const { data } = await api.get<BotStats>('/stats')
   return data
 }
 
@@ -58,14 +33,3 @@ export async function stopBot(): Promise<{ status: string; is_running: boolean }
   const { data } = await api.post('/bot/stop')
   return data
 }
-
-export async function settleTradesApi(): Promise<{ settled_count: number }> {
-  const { data } = await api.post('/settle-trades')
-  return data
-}
-
-export async function resetBot(): Promise<{ status: string; trades_deleted: number; new_bankroll: number }> {
-  const { data } = await api.post('/bot/reset')
-  return data
-}
-

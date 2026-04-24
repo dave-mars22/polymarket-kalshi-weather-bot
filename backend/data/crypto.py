@@ -18,8 +18,14 @@ BYBIT_API = "https://api.bybit.com/v5/market"
 COINBASE_API = "https://api.exchange.coinbase.com"
 KRAKEN_API = "https://api.kraken.com/0/public"
 
-# 30-second cache to avoid hammering Binance during a single scan cycle
-_kline_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
+# Per-underlying kline cache. Shape:
+#   {"BTC": {"data": [...], "ts": <float>, "source": "coinbase"|...},
+#    "ETH": {...}, ...}
+# Slice 3a-1 fix: was a single-slot cache that would silently return BTC
+# data when asked for ETH within TTL, corrupting multi-asset scans.
+# Currently only BTC is used; slice 3a-2 parameterizes fetch_klines() so
+# this cache actually exercises multiple keys.
+_kline_cache: Dict[str, Dict[str, Any]] = {}
 _CACHE_TTL = 30.0
 
 
@@ -52,9 +58,13 @@ async def fetch_binance_klines(limit: int = 60) -> Optional[List[list]]:
 
     Returns list of [open_time, open, high, low, close, volume, ...] or None.
     """
+    # NOTE: still hardcoded to "BTC" in 3a-1 (cache shape fix only).
+    # Slice 3a-2 takes `underlying` as a parameter and renames to fetch_klines.
+    underlying = "BTC"
     now = time.time()
-    if _kline_cache["data"] is not None and (now - _kline_cache["ts"]) < _CACHE_TTL:
-        return _kline_cache["data"]
+    entry = _kline_cache.get(underlying)
+    if entry is not None and entry.get("data") is not None and (now - entry.get("ts", 0.0)) < _CACHE_TTL:
+        return entry["data"]
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         # Try Coinbase first (US-accessible, reliable)
@@ -78,9 +88,7 @@ async def fetch_binance_klines(limit: int = 60) -> Optional[List[list]]:
                 [int(r[0]) * 1000, str(r[3]), str(r[2]), str(r[1]), str(r[4]), str(r[5])]
                 for r in rows
             ]
-            _kline_cache["data"] = candles
-            _kline_cache["ts"] = now
-            _kline_cache["_source"] = "coinbase"
+            _kline_cache[underlying] = {"data": candles, "ts": now, "source": "coinbase"}
             return candles
         except Exception as e:
             logger.warning(f"Coinbase kline fetch failed, trying Kraken: {e}")
@@ -102,9 +110,7 @@ async def fetch_binance_klines(limit: int = 60) -> Optional[List[list]]:
                     [int(r[0]) * 1000, str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[6])]
                     for r in rows
                 ]
-                _kline_cache["data"] = candles
-                _kline_cache["ts"] = now
-                _kline_cache["_source"] = "kraken"
+                _kline_cache[underlying] = {"data": candles, "ts": now, "source": "kraken"}
                 return candles
         except Exception as e:
             logger.warning(f"Kraken kline fetch failed, trying Binance: {e}")
@@ -117,9 +123,7 @@ async def fetch_binance_klines(limit: int = 60) -> Optional[List[list]]:
             )
             resp.raise_for_status()
             candles = resp.json()
-            _kline_cache["data"] = candles
-            _kline_cache["ts"] = now
-            _kline_cache["_source"] = "binance"
+            _kline_cache[underlying] = {"data": candles, "ts": now, "source": "binance"}
             return candles
         except Exception as e:
             logger.warning(f"Binance kline fetch failed, trying Bybit: {e}")
@@ -143,9 +147,7 @@ async def fetch_binance_klines(limit: int = 60) -> Optional[List[list]]:
                 [int(r[0]), r[1], r[2], r[3], r[4], r[5]]
                 for r in rows
             ]
-            _kline_cache["data"] = candles
-            _kline_cache["ts"] = now
-            _kline_cache["_source"] = "bybit"
+            _kline_cache[underlying] = {"data": candles, "ts": now, "source": "bybit"}
             return candles
         except Exception as e:
             logger.error(f"All kline sources failed: {e}")
@@ -238,7 +240,7 @@ async def compute_btc_microstructure() -> Optional[BtcMicrostructure]:
     else:
         volatility = 0.0
 
-    source = _kline_cache.get("_source", "unknown")
+    source = _kline_cache.get("BTC", {}).get("source", "unknown")
 
     return BtcMicrostructure(
         rsi=rsi,

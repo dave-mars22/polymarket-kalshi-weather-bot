@@ -4,6 +4,7 @@ import { motion } from 'framer-motion'
 import { runScan, simulateTrade, startBot, stopBot } from './api'
 import { useDashboard } from './hooks/useDashboard'
 import { PortfolioHeader } from './components/PortfolioHeader'
+import { StrategyCards } from './components/StrategyCards'
 import { SignalsTable } from './components/SignalsTable'
 import { TradesTable } from './components/TradesTable'
 import { EquityChart } from './components/EquityChart'
@@ -181,6 +182,16 @@ function App() {
           <LiveClock />
         </div>
       </motion.header>
+
+      {/* ===== STRATEGY CARDS (slice D5) ===== */}
+      <motion.div
+        initial={{ opacity: 0, y: -4 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.05 }}
+        className="shrink-0 px-2 py-1.5 border-b border-neutral-800"
+      >
+        <StrategyCards data={data} />
+      </motion.div>
 
       {/* ===== MAIN GRID ===== */}
       <div className="flex-1 min-h-0 grid grid-cols-[300px_1fr_340px] grid-rows-[1fr] gap-0">

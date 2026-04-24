@@ -143,6 +143,18 @@ async def generate_crypto_tech_signal(
     if market_up_prob < 0.02 or market_up_prob > 0.98:
         return None
 
+    # Dead-market 24h-volume gate (slice 3f). Skip early so we don't
+    # persist no-edge signal rows for markets nobody actually trades.
+    # BTC consistently clears the default $50 threshold; SOL/XRP upcoming
+    # windows with $0 24h volume are filtered; ETH nearest-expiry
+    # typically passes while upcoming windows do not.
+    if market.volume_24h < settings.MIN_MARKET_VOLUME_24H_USD:
+        logger.debug(
+            f"skip {underlying} {market.slug}: volume_24h "
+            f"${market.volume_24h:.2f} < ${settings.MIN_MARKET_VOLUME_24H_USD:.2f}"
+        )
+        return None
+
     # --- Individual indicator signals ---
 
     # 1) RSI

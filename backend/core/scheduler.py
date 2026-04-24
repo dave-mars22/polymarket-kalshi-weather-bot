@@ -117,6 +117,25 @@ async def scan_and_trade_job():
             # avoid mixing old and new rows.
             trades_executed = 0
             for signal in actionable[:MAX_TRADES_PER_SCAN]:
+                # Per-underlying pending cap (slice 3f). Prevents any one
+                # crypto (particularly high-vol SOL or if one asset starts
+                # firing often) from monopolizing the open-trade queue.
+                # Filters on Trade.underlying_asset, which is NULL for
+                # legacy pre-slice-3e BTC rows — those are excluded from
+                # the count, which is fine: they're all settled anyway.
+                pending_same_underlying = db.query(Trade).filter(
+                    Trade.settled == False,  # noqa: E712
+                    Trade.underlying_asset == signal.underlying,
+                ).count()
+                if pending_same_underlying >= settings.MAX_PENDING_PER_UNDERLYING:
+                    log_event(
+                        "info",
+                        f"skip {signal.market.slug}: "
+                        f"{pending_same_underlying} pending {signal.underlying} trades "
+                        f"(cap {settings.MAX_PENDING_PER_UNDERLYING})",
+                    )
+                    continue
+
                 # Check if we already have a trade for this market window
                 existing = db.query(Trade).filter(
                     Trade.event_slug == signal.market.slug,

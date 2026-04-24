@@ -64,7 +64,8 @@ class CryptoUpDownMarket:
     down_price: float
     window_start: datetime
     window_end: datetime
-    volume: float
+    volume: float          # lifetime volume
+    volume_24h: float      # 24-hour trailing volume (slice 3f dead-market filter reads this)
     closed: bool
 
     @property
@@ -166,6 +167,7 @@ def _parse_event_to_crypto_market(event: dict) -> Optional[CryptoUpDownMarket]:
         window_start=window_start,
         window_end=window_end,
         volume=float(market.get("volume", 0) or 0),
+        volume_24h=float(market.get("volume24hr", 0) or 0),
         closed=bool(market.get("closed", False) or event.get("closed", False)),
     )
 

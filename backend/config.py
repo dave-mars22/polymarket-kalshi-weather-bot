@@ -112,6 +112,15 @@ class Settings(BaseSettings):
     # agnostic signal logic so adding/removing entries is cheap. Slice
     # 3c adds ETH; 3d adds SOL + XRP after live verification.
     CRYPTO_TECH_UNDERLYINGS: str = "BTC,ETH,SOL,XRP"
+    # Per-underlying pending-trade cap. Prevents any single crypto from
+    # dominating the open-trade queue and concentrating risk. Mirrors MC's
+    # MC_MAX_OPEN_PER_SERIES pattern.
+    MAX_PENDING_PER_UNDERLYING: int = 8
+    # Minimum 24-hour volume ($USD) on a market before we produce a signal.
+    # Filters dead markets so calibration data stays clean. Observed
+    # volumes at slice 3d: BTC ~$116, ETH nearest ~$119 (upcoming $0),
+    # SOL/XRP upcoming $0. Passes BTC + ETH-nearest; filters the rest.
+    MIN_MARKET_VOLUME_24H_USD: float = 50.0
 
     class Config:
         env_file = ".env"

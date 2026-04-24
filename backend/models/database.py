@@ -27,6 +27,8 @@ class Trade(Base):
     platform = Column(String)
     event_slug = Column(String, nullable=True)
     market_type = Column(String, default="btc", index=True)  # "btc" or "monte_carlo"
+    underlying_asset = Column(String, nullable=True, index=True)  # "BTC", "SPX" for MC
+    asset_class = Column(String, nullable=True, index=True)       # "crypto", "equity_index" for MC
 
     # Trade details
     direction = Column(String)  # "up" or "down"
@@ -78,6 +80,8 @@ class Signal(Base):
     market_ticker = Column(String, index=True)
     platform = Column(String)
     market_type = Column(String, default="btc", index=True)  # "btc" or "monte_carlo"
+    underlying_asset = Column(String, nullable=True, index=True)  # "BTC", "SPX" for MC
+    asset_class = Column(String, nullable=True, index=True)       # "crypto", "equity_index" for MC
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
     direction = Column(String)
@@ -174,6 +178,19 @@ def ensure_schema():
             with conn.begin():
                 conn.execute(text("ALTER TABLE trades ADD COLUMN market_type VARCHAR DEFAULT 'btc'"))
 
+    # MC-era columns on trades: underlying_asset, asset_class
+    for col, coltype in [
+        ("underlying_asset", "VARCHAR"),
+        ("asset_class", "VARCHAR"),
+    ]:
+        if col not in columns:
+            with engine.connect() as conn:
+                try:
+                    with conn.begin():
+                        conn.execute(text(f"ALTER TABLE trades ADD COLUMN {col} {coltype}"))
+                except Exception:
+                    pass
+
     # Add calibration columns to signals table
     try:
         signal_columns = [col["name"] for col in inspector.get_columns("signals")]
@@ -188,6 +205,8 @@ def ensure_schema():
                 ("settlement_value", "FLOAT"),
                 ("settled_at", "DATETIME"),
                 ("market_type", "VARCHAR DEFAULT 'btc'"),
+                ("underlying_asset", "VARCHAR"),
+                ("asset_class", "VARCHAR"),
             ]:
                 if col not in signal_columns:
                     try:

@@ -74,6 +74,24 @@ class Settings(BaseSettings):
     MC_HISTORICAL_CACHE_SECONDS: int = 3600   # 1 h — vol barely moves intraday
     MC_SPOT_CACHE_SECONDS: int = 30           # 30 s — fresh enough for daily markets
     MC_MAX_TIME_TO_EXPIRY_DAYS: float = 30.0  # skip contracts expiring beyond 30 days
+    MC_ENABLED: bool = True
+    # Simulation
+    MC_NUM_PATHS: int = 10_000
+    MC_VOL_LOOKBACK_DAYS: int = 30
+    MC_USE_EWMA_VOL: bool = True
+    MC_EWMA_LAMBDA: float = 0.94              # RiskMetrics standard
+    MC_DRIFT_LOOKBACK_DAYS: int = 90
+    MC_MIN_HISTORY_DAYS: int = 60
+    # Edge gating
+    MC_MIN_EDGE_THRESHOLD: float = 0.05
+    MC_MAX_ENTRY_PRICE: float = 0.75
+    MC_MIN_TIME_TO_EXPIRY_HOURS: float = 1.0
+    # Position sizing — all as fractions of current (live) bankroll
+    MC_MAX_TRADE_SIZE_PCT: float = 0.03
+    MC_MAX_PER_UNDERLYING_PCT: float = 0.08
+    MC_MAX_ASSET_CLASS_PCT: float = 0.15
+    MC_MAX_TOTAL_ALLOCATION_PCT: float = 0.40
+    MC_MAX_TRADES_PER_SCAN: int = 5
 
     class Config:
         env_file = ".env"

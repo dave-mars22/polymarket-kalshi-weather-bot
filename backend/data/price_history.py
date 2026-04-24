@@ -1,8 +1,8 @@
 """Historical daily price fetchers for Monte Carlo vol/drift estimation.
 
 Asset-class routing:
-    - "crypto" -> Coinbase Exchange public API
-Other asset classes (equity_index, etc.) will be added in later slices.
+    - "crypto"       -> Coinbase Exchange public API
+    - "equity_index" -> yfinance (Yahoo Finance)
 
 All fetchers return `list[tuple[date, float]]` oldest-first chronologically
 so callers can pass `[close for _, close in bars]` straight into log_returns.
@@ -72,6 +72,8 @@ def fetch_daily_closes(
 
     if asset_class == "crypto":
         bars = _fetch_coinbase_daily(symbol, days, http_client=http_client)
+    elif asset_class == "equity_index":
+        bars = _fetch_yfinance_daily(symbol, days)
     else:
         raise PriceHistoryError(f"Unsupported asset_class: {asset_class!r}")
 
@@ -137,6 +139,59 @@ def _fetch_coinbase_daily(
     if len(bars) > days:
         bars = bars[-days:]
 
+    return bars
+
+
+def _fetch_yfinance_daily(symbol: str, days: int) -> List[Tuple[date, float]]:
+    """Fetch `days` daily closes from Yahoo Finance via yfinance.
+
+    Used for equity indices (^GSPC, ^NDX). yfinance internally uses Yahoo's
+    chart endpoint; no http_client injection seam (unlike Coinbase). Tests
+    must mock yfinance.Ticker directly.
+
+    Rate limits: yfinance wraps an unofficial Yahoo endpoint. No documented
+    hard limit; our hourly cache keeps actual call rate low. On 429 yfinance
+    raises, which propagates as PriceHistoryError below.
+    """
+    import yfinance as yf  # lazy import so crypto-only usage doesn't pay the cost
+
+    end = datetime.now(timezone.utc)
+    # yfinance returns *trading* days only (~252/365 of calendar days).
+    # To get `days` bars we need to request ~1.5x that in calendar days,
+    # plus a small buffer for US market holidays.
+    calendar_days = int(days * 1.5) + 10
+    start = end - timedelta(days=calendar_days)
+
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(
+            start=start.date().isoformat(),
+            end=end.date().isoformat(),
+            interval="1d",
+        )
+    except Exception as e:
+        raise PriceHistoryError(f"yfinance {symbol}: {type(e).__name__}: {e}") from e
+
+    if hist is None or len(hist) == 0:
+        raise PriceHistoryError(f"yfinance {symbol}: empty history response")
+    if "Close" not in hist.columns:
+        raise PriceHistoryError(f"yfinance {symbol}: response missing Close column")
+
+    bars: List[Tuple[date, float]] = []
+    for ts, row in hist.iterrows():
+        try:
+            close = float(row["Close"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if close <= 0:
+            continue
+        # ts may be a pandas Timestamp (tz-aware for indices) or a date.
+        d = ts.date() if hasattr(ts, "date") else ts
+        bars.append((d, close))
+
+    bars.sort(key=lambda b: b[0])
+    if len(bars) > days:
+        bars = bars[-days:]
     return bars
 
 

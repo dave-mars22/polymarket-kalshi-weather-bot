@@ -41,15 +41,20 @@ from backend.models.database import BotState, SessionLocal, Trade
 
 logger = logging.getLogger("trading_bot")
 
-# Kalshi underlying symbol -> Coinbase product symbol. 1:1 today; layer
-# exists so we don't assume that for future underlyings.
-_COINBASE_SYMBOL_MAP: Dict[str, str] = {
-    "BTC": "BTC",
-    "ETH": "ETH",
-    "SOL": "SOL",
-    "BCH": "BCH",
+# Kalshi underlying symbol -> symbol expected by the price-data adapter.
+# Crypto symbols map 1:1 to Coinbase product IDs (the data-layer dispatches
+# by asset_class internally). Equity indices map to Yahoo Finance tickers.
+_UNDERLYING_TO_SYMBOL: Dict[str, str] = {
+    # Crypto (Coinbase)
+    "BTC":  "BTC",
+    "ETH":  "ETH",
+    "SOL":  "SOL",
+    "BCH":  "BCH",
     "AVAX": "AVAX",
     "SHIB": "SHIB",
+    # Equity indices (yfinance)
+    "SPX":  "^GSPC",
+    "NDX":  "^NDX",
 }
 
 _PERIODS_PER_YEAR_BY_ASSET_CLASS: Dict[str, float] = {
@@ -173,8 +178,8 @@ def _simulate_group(
     if years_to_expiry <= 0:
         raise ValueError(f"close_time {close_time} already passed")
 
-    coinbase_symbol = _COINBASE_SYMBOL_MAP.get(underlying)
-    if coinbase_symbol is None:
+    price_symbol = _UNDERLYING_TO_SYMBOL.get(underlying)
+    if price_symbol is None:
         raise ValueError(f"No spot/history source for underlying {underlying!r}")
 
     # Fetch enough history to cover the larger of vol/drift windows + buffer.
@@ -182,10 +187,10 @@ def _simulate_group(
         settings.MC_MIN_HISTORY_DAYS,
         max(settings.MC_VOL_LOOKBACK_DAYS, settings.MC_DRIFT_LOOKBACK_DAYS) + 10,
     )
-    history = fetch_daily_closes(coinbase_symbol, asset_class, days=request_days)
+    history = fetch_daily_closes(price_symbol, asset_class, days=request_days)
     prices = [close for _, close in history]
 
-    spot = fetch_spot(coinbase_symbol, asset_class)
+    spot = fetch_spot(price_symbol, asset_class)
 
     periods_per_year = _PERIODS_PER_YEAR_BY_ASSET_CLASS.get(asset_class, 365.0)
     est = estimate_vol_drift(

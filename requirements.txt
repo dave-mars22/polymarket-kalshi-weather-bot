@@ -13,10 +13,11 @@ aiohttp==3.9.1
 # Kalshi API auth (RSA-PSS signatures)
 cryptography>=42.0.0
 
-# Weather data (using Open-Meteo API)
+# Market data
 numpy==1.26.3
 pandas==2.1.4
 scipy==1.12.0
+yfinance>=0.2.40  # equity-index history + spot for monte_carlo brain
 
 # Scheduling
 apscheduler==3.10.4

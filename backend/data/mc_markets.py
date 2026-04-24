@@ -4,13 +4,15 @@ Scans exchange APIs for binary price-continuous contracts that can be
 priced with Geometric Brownian Motion, returning a list of
 MonteCarloMarket dataclasses consumed by the signal generator.
 
-Venue coverage (Slice 1d):
-    - Kalshi crypto daily series (unauthenticated /trade-api/v2/markets)
+Venue coverage:
+    - Kalshi crypto daily series      (Slice 1d)
+    - Kalshi equity-index daily series (Slice 2, SPX + NDX)
 
 Not yet implemented:
-    - Polymarket crypto markets (Slice 1d-bis)
-    - Kalshi equity-index series (Slice 2)
-    - Hourly / weekly / monthly / annual Kalshi crypto series
+    - Polymarket crypto / index markets
+    - Hourly / weekly / monthly / annual Kalshi series (we restrict to daily
+      because constant-vol GBM is weakest over long horizons and our scan
+      cadence is too slow for intraday contracts)
 """
 from __future__ import annotations
 
@@ -28,9 +30,9 @@ logger = logging.getLogger("trading_bot")
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 # (series_ticker, underlying_symbol, asset_class)
-# Only daily-frequency crypto series in Slice 1d. Monthly/annual/hourly
-# deferred — they stress GBM's constant-vol assumption (long horizons) or
-# overwhelm our scan cadence (short horizons).
+# Only daily-frequency series. Monthly/annual/hourly deferred — they stress
+# GBM's constant-vol assumption (long horizons) or overwhelm our scan
+# cadence (short horizons).
 KALSHI_CRYPTO_SERIES: List[Tuple[str, str, str]] = [
     ("KXBTCD",    "BTC",  "crypto"),
     ("KXBCH",     "BCH",  "crypto"),
@@ -38,6 +40,31 @@ KALSHI_CRYPTO_SERIES: List[Tuple[str, str, str]] = [
     ("KXAVAXD",   "AVAX", "crypto"),
     ("KXBTCMAXD", "BTC",  "crypto"),
 ]
+
+# SPX and NDX each expose a mix of legacy and KX-prefixed series that often
+# emit identical contracts. The dedup pass in fetch_mc_markets collapses them
+# by (underlying, direction, threshold, close_time).
+KALSHI_EQUITY_INDEX_SERIES: List[Tuple[str, str, str]] = [
+    # SPX daily
+    ("INX",       "SPX", "equity_index"),
+    ("INXU",      "SPX", "equity_index"),
+    ("INXZ",      "SPX", "equity_index"),
+    ("INXAB",     "SPX", "equity_index"),
+    ("KXINX",     "SPX", "equity_index"),
+    ("KXINXZ",    "SPX", "equity_index"),
+    ("KXINXAB",   "SPX", "equity_index"),
+    # NDX daily
+    ("NASDAQ100",  "NDX", "equity_index"),
+    ("NASDAQ100U", "NDX", "equity_index"),
+    ("NASDAQ100Z", "NDX", "equity_index"),
+    ("KXNASDAQ100",  "NDX", "equity_index"),
+    ("KXNASDAQ100Z", "NDX", "equity_index"),
+]
+
+# Combined set — fetch_mc_markets iterates and filters by asset_class arg.
+KALSHI_SERIES: List[Tuple[str, str, str]] = (
+    KALSHI_CRYPTO_SERIES + KALSHI_EQUITY_INDEX_SERIES
+)
 
 _KALSHI_PAGE_LIMIT = 200
 
@@ -91,7 +118,7 @@ def fetch_mc_markets(
     markets: List[MonteCarloMarket] = []
     seen: set = set()
 
-    for series_ticker, underlying, asset_class in KALSHI_CRYPTO_SERIES:
+    for series_ticker, underlying, asset_class in KALSHI_SERIES:
         if asset_class not in asset_classes:
             continue
         try:
@@ -118,7 +145,7 @@ def fetch_mc_markets(
 
     logger.info(
         f"MC market discovery: {len(markets)} unique markets across "
-        f"{len([s for s in KALSHI_CRYPTO_SERIES if s[2] in asset_classes])} series"
+        f"{len([s for s in KALSHI_SERIES if s[2] in asset_classes])} series"
     )
     return markets
 

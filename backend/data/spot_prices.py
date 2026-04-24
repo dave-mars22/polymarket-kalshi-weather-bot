@@ -1,16 +1,23 @@
 """Live spot-price fetchers for Monte Carlo simulation.
 
 Asset-class routing:
-    - "crypto" -> Coinbase Exchange /ticker endpoint
+    - "crypto"       -> Coinbase Exchange /ticker endpoint
+    - "equity_index" -> yfinance (Yahoo Finance)
 
 Returns a single float price. Cached for MC_SPOT_CACHE_SECONDS (default 30 s)
 to avoid hammering the exchange when multiple markets reference the same
 underlying within one scan cycle.
+
+Index handling: outside US market hours, yfinance returns the last close.
+Daily Kalshi index contracts settle on official close anyway, so a last-close
+value is fine as the "current spot." We log at INFO level when we detect
+outside-hours conditions.
 """
 from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
 import httpx
@@ -45,6 +52,8 @@ def fetch_spot(
 
     if asset_class == "crypto":
         price = _fetch_coinbase_spot(symbol, http_client=http_client)
+    elif asset_class == "equity_index":
+        price = _fetch_yfinance_spot(symbol)
     else:
         raise SpotPriceError(f"Unsupported asset_class: {asset_class!r}")
 
@@ -85,6 +94,54 @@ def _fetch_coinbase_spot(
         raise SpotPriceError(f"Coinbase {symbol}: non-positive price {price}")
 
     return price
+
+
+def _fetch_yfinance_spot(symbol: str) -> float:
+    """Fetch latest price from Yahoo Finance.
+
+    Returns yfinance's fast_info.last_price, which is:
+      - The live (~15-min-delayed) price during US market hours
+      - The previous close when the market is closed
+    Both are acceptable for daily Kalshi index contracts (settlement is on
+    official close). We log at INFO level when outside market hours.
+    """
+    import yfinance as yf
+
+    try:
+        ticker = yf.Ticker(symbol)
+        price = ticker.fast_info.last_price
+    except Exception as e:
+        raise SpotPriceError(f"yfinance {symbol}: {type(e).__name__}: {e}") from e
+
+    if price is None:
+        raise SpotPriceError(f"yfinance {symbol}: last_price was None")
+    try:
+        price = float(price)
+    except (TypeError, ValueError) as e:
+        raise SpotPriceError(f"yfinance {symbol}: invalid price {price!r}") from e
+    if price <= 0:
+        raise SpotPriceError(f"yfinance {symbol}: non-positive price {price}")
+
+    if not _is_us_equity_market_open():
+        logger.info(
+            f"yfinance {symbol}: fetched outside US market hours; "
+            f"value {price:.2f} is last close"
+        )
+
+    return price
+
+
+def _is_us_equity_market_open() -> bool:
+    """Crude check: weekday and 13:30-20:00 UTC (approximates 9:30-16:00 ET).
+
+    Ignores US holidays and DST transitions (±1h off during transition windows).
+    Only used for logging; incorrect answers don't affect price correctness.
+    """
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    mins = now.hour * 60 + now.minute
+    return 13 * 60 + 30 <= mins <= 20 * 60
 
 
 def _get_with_retry(

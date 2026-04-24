@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 
@@ -134,6 +134,60 @@ class TestErrorPaths(SpotTestCase):
         with self._client(handler) as client:
             with self.assertRaises(httpx.HTTPStatusError):
                 fetch_spot("NOTACOIN", "crypto", http_client=client)
+
+
+class TestYFinanceSpot(SpotTestCase):
+    """yfinance path for equity_index."""
+
+    def _fake_ticker(self, price):
+        t = MagicMock()
+        t.fast_info.last_price = price
+        return t
+
+    def test_returns_last_price_as_float(self):
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value = self._fake_ticker(5842.5)
+            price = fetch_spot("^GSPC", "equity_index")
+        self.assertEqual(price, 5842.5)
+        self.assertIsInstance(price, float)
+
+    def test_cached(self):
+        call_count = {"n": 0}
+
+        def make_ticker(sym):
+            call_count["n"] += 1
+            return self._fake_ticker(5000.0)
+
+        with patch("yfinance.Ticker", side_effect=make_ticker):
+            fetch_spot("^GSPC", "equity_index")
+            fetch_spot("^GSPC", "equity_index")
+        self.assertEqual(call_count["n"], 1)
+
+    def test_none_price_raises(self):
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value = self._fake_ticker(None)
+            with self.assertRaises(SpotPriceError):
+                fetch_spot("^GSPC", "equity_index")
+
+    def test_non_positive_raises(self):
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value = self._fake_ticker(0.0)
+            with self.assertRaises(SpotPriceError):
+                fetch_spot("^GSPC", "equity_index")
+        spot_prices._clear_cache()
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value = self._fake_ticker(-1.0)
+            with self.assertRaises(SpotPriceError):
+                fetch_spot("^GSPC", "equity_index")
+
+    def test_yfinance_exception_raises_spot_price_error(self):
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            bad = MagicMock()
+            # Accessing fast_info.last_price on a broken ticker should raise
+            type(bad).fast_info = property(lambda self: (_ for _ in ()).throw(RuntimeError("yahoo down")))
+            mock_ticker_cls.return_value = bad
+            with self.assertRaises(SpotPriceError):
+                fetch_spot("^GSPC", "equity_index")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import date, datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 
@@ -222,6 +222,83 @@ class TestErrorPaths(PriceHistoryTestCase):
             bars = fetch_daily_closes("BTC", "crypto", days=5, http_client=client)
 
         self.assertEqual(len(bars), 5)
+
+
+class TestYFinanceAdapter(PriceHistoryTestCase):
+    """yfinance path for equity_index. yfinance is patched at the module level."""
+
+    def _fake_ticker(self, df):
+        ticker = MagicMock()
+        ticker.history.return_value = df
+        return ticker
+
+    def _fake_df(self, n: int, start_date=None, base: float = 5000.0):
+        import pandas as pd
+        if start_date is None:
+            start_date = date(2026, 1, 1)
+        idx = pd.date_range(start=start_date, periods=n, freq="B", tz="America/New_York")
+        return pd.DataFrame({
+            "Open": [base + i * 10 for i in range(n)],
+            "High": [base + i * 10 + 5 for i in range(n)],
+            "Low":  [base + i * 10 - 5 for i in range(n)],
+            "Close": [base + i * 10 for i in range(n)],
+            "Volume": [1_000_000] * n,
+        }, index=idx)
+
+    def test_happy_path_returns_oldest_first(self):
+        df = self._fake_df(n=30, start_date=date(2026, 3, 1), base=5800.0)
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value = self._fake_ticker(df)
+            bars = fetch_daily_closes("^GSPC", "equity_index", days=30)
+        self.assertEqual(len(bars), 30)
+        dates = [b[0] for b in bars]
+        self.assertEqual(dates, sorted(dates))
+        self.assertEqual(bars[0][1], 5800.0)
+        self.assertEqual(bars[-1][1], 5800.0 + 29 * 10)
+
+    def test_cached(self):
+        df = self._fake_df(n=20, base=6000.0)
+        call_count = {"n": 0}
+
+        def make_ticker(sym):
+            call_count["n"] += 1
+            return self._fake_ticker(df)
+
+        with patch("yfinance.Ticker", side_effect=make_ticker):
+            fetch_daily_closes("^GSPC", "equity_index", days=20)
+            fetch_daily_closes("^GSPC", "equity_index", days=20)
+        self.assertEqual(call_count["n"], 1)
+
+    def test_empty_history_raises(self):
+        import pandas as pd
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value = self._fake_ticker(pd.DataFrame())
+            with self.assertRaises(PriceHistoryError):
+                fetch_daily_closes("^GSPC", "equity_index", days=20)
+
+    def test_insufficient_history_raises(self):
+        df = self._fake_df(n=5, base=6000.0)  # asked for 30, got 5
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value = self._fake_ticker(df)
+            with self.assertRaises(InsufficientHistoryError):
+                fetch_daily_closes("^GSPC", "equity_index", days=30)
+
+    def test_yfinance_exception_raises_price_history_error(self):
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            bad = MagicMock()
+            bad.history.side_effect = RuntimeError("yahoo down")
+            mock_ticker_cls.return_value = bad
+            with self.assertRaises(PriceHistoryError):
+                fetch_daily_closes("^GSPC", "equity_index", days=20)
+
+    def test_missing_close_column_raises(self):
+        import pandas as pd
+        idx = pd.date_range(start=date(2026, 1, 1), periods=20, freq="B")
+        df = pd.DataFrame({"Open": [1.0] * 20}, index=idx)  # no Close
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value = self._fake_ticker(df)
+            with self.assertRaises(PriceHistoryError):
+                fetch_daily_closes("^GSPC", "equity_index", days=20)
 
 
 if __name__ == "__main__":

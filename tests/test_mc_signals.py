@@ -299,5 +299,62 @@ class TestAllocationCaps(MCSignalsTestCase):
         self.assertLessEqual(signals[0].suggested_size, 1.0 + 1e-9)
 
 
+class TestEquityIndexAssetClass(MCSignalsTestCase):
+    """SPX/NDX go through the same signal generator path, just with a
+    different underlying symbol + periods_per_year (252 trading days)."""
+
+    def test_spx_signal_flows_through(self):
+        close = datetime.now(timezone.utc) + timedelta(days=2)
+        m = _make_market(
+            ticker="KXINX-26APR25-T5900",
+            threshold=5900.0, close_time=close,
+            yes_ask=0.20, no_ask=0.80,
+            underlying="SPX", asset_class="equity_index",
+        )
+        sim = _sim_with_p_above(0.40, threshold=5900.0)
+
+        with self._patches(markets=[m], sim=sim, spot_price=5800.0)[0]:
+            signals = scan_for_mc_signals()
+
+        self.assertEqual(len(signals), 1)
+        s = signals[0]
+        self.assertEqual(s.market.underlying_asset, "SPX")
+        self.assertEqual(s.market.asset_class, "equity_index")
+        # Signal logic identical to crypto: picks the side with better edge
+        self.assertEqual(s.direction, "YES")  # model_p=0.40 > ask=0.20
+
+    def test_ndx_signal_flows_through(self):
+        close = datetime.now(timezone.utc) + timedelta(days=2)
+        m = _make_market(
+            ticker="NASDAQ100-26APR25-T18000",
+            threshold=18_000.0, close_time=close,
+            yes_ask=0.55, no_ask=0.45,
+            underlying="NDX", asset_class="equity_index",
+        )
+        sim = _sim_with_p_above(0.62, threshold=18_000.0)
+
+        with self._patches(markets=[m], sim=sim, spot_price=17_900.0)[0]:
+            signals = scan_for_mc_signals()
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0].market.underlying_asset, "NDX")
+        self.assertEqual(signals[0].direction, "YES")  # 0.62 > 0.55
+
+    def test_unknown_underlying_raises_via_simulate_group(self):
+        """Underlying without an entry in _UNDERLYING_TO_SYMBOL must skip group."""
+        close = datetime.now(timezone.utc) + timedelta(days=2)
+        m = _make_market(
+            ticker="KXUNKNOWN-X", underlying="UNKNOWN", asset_class="equity_index",
+            close_time=close,
+        )
+        sim = _sim_with_p_above(0.40, threshold=m.threshold)
+
+        with self._patches(markets=[m], sim=sim)[0]:
+            signals = scan_for_mc_signals()
+
+        # Group is skipped (logged at info); signals list is empty.
+        self.assertEqual(signals, [])
+
+
 if __name__ == "__main__":
     unittest.main()

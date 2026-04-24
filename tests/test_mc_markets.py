@@ -13,6 +13,8 @@ import httpx
 
 from backend.data.mc_markets import (
     KALSHI_CRYPTO_SERIES,
+    KALSHI_EQUITY_INDEX_SERIES,
+    KALSHI_SERIES,
     MonteCarloMarket,
     fetch_mc_markets,
 )
@@ -330,10 +332,111 @@ class TestFilterArgs(MCMarketsTestCase):
             return _response_for_series(req.url.params.get("series_ticker"), [])
 
         with self._client(handler) as client:
-            result = fetch_mc_markets(["equity_index"], http_client=client)
+            # "stock" is not in any registered KALSHI_SERIES entry
+            result = fetch_mc_markets(["stock"], http_client=client)
 
         self.assertEqual(result, [])
         self.assertEqual(state["calls"], 0)
+
+
+class TestEquityIndexScan(MCMarketsTestCase):
+    def test_spx_scan_returns_market_with_correct_underlying(self):
+        close_time = datetime.now(timezone.utc) + timedelta(days=2)
+        spx_market = _make_market(
+            "KXINX-26APR24-T5900", strike_type="greater",
+            floor_strike=5900.0, close_time=close_time,
+        )
+
+        def handler(req):
+            s = req.url.params.get("series_ticker")
+            if s == "KXINX":
+                return _response_for_series(s, [spx_market])
+            return _response_for_series(s, [])
+
+        with self._client(handler) as client:
+            result = fetch_mc_markets(["equity_index"], http_client=client)
+
+        self.assertEqual(len(result), 1)
+        m = result[0]
+        self.assertEqual(m.underlying_asset, "SPX")
+        self.assertEqual(m.asset_class, "equity_index")
+        self.assertEqual(m.direction, "above")
+        self.assertEqual(m.threshold, 5900.0)
+
+    def test_ndx_scan_returns_market_with_correct_underlying(self):
+        close_time = datetime.now(timezone.utc) + timedelta(days=2)
+        ndx_market = _make_market(
+            "NASDAQ100-26APR24-T18000", strike_type="greater",
+            floor_strike=18_000.0, close_time=close_time,
+        )
+
+        def handler(req):
+            s = req.url.params.get("series_ticker")
+            if s == "NASDAQ100":
+                return _response_for_series(s, [ndx_market])
+            return _response_for_series(s, [])
+
+        with self._client(handler) as client:
+            result = fetch_mc_markets(["equity_index"], http_client=client)
+
+        self.assertEqual(len(result), 1)
+        m = result[0]
+        self.assertEqual(m.underlying_asset, "NDX")
+        self.assertEqual(m.asset_class, "equity_index")
+
+    def test_legacy_and_kx_prefixed_series_dedup_on_same_underlying(self):
+        """INX and KXINX both map to SPX; identical markets must collapse."""
+        close_time = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)
+        dup_a = _make_market("INX-DUP", floor_strike=5900.0, close_time=close_time)
+        dup_b = _make_market("KXINX-DUP", floor_strike=5900.0, close_time=close_time)
+
+        def handler(req):
+            s = req.url.params.get("series_ticker")
+            if s == "INX":
+                return _response_for_series(s, [dup_a])
+            if s == "KXINX":
+                return _response_for_series(s, [dup_b])
+            return _response_for_series(s, [])
+
+        with self._client(handler) as client:
+            result = fetch_mc_markets(["equity_index"], http_client=client)
+
+        self.assertEqual(len(result), 1)
+        # Whichever ran first in KALSHI_SERIES order wins; our ordering has INX first.
+        self.assertEqual(result[0].ticker, "INX-DUP")
+
+    def test_crypto_only_request_skips_equity_series(self):
+        """asset_classes=['crypto'] must not hit any equity series."""
+        seen_series = []
+
+        def handler(req):
+            s = req.url.params.get("series_ticker")
+            seen_series.append(s)
+            return _response_for_series(s, [])
+
+        with self._client(handler) as client:
+            fetch_mc_markets(["crypto"], http_client=client)
+
+        crypto_tickers = {t for t, _, _ in KALSHI_CRYPTO_SERIES}
+        equity_tickers = {t for t, _, _ in KALSHI_EQUITY_INDEX_SERIES}
+        self.assertTrue(crypto_tickers.issubset(set(seen_series)))
+        self.assertTrue(equity_tickers.isdisjoint(set(seen_series)))
+
+    def test_both_asset_classes_requested_scans_all(self):
+        seen_series = []
+
+        def handler(req):
+            s = req.url.params.get("series_ticker")
+            seen_series.append(s)
+            return _response_for_series(s, [])
+
+        with self._client(handler) as client:
+            fetch_mc_markets(["crypto", "equity_index"], http_client=client)
+
+        self.assertEqual(
+            set(seen_series),
+            {t for t, _, _ in KALSHI_SERIES},
+        )
 
 
 if __name__ == "__main__":

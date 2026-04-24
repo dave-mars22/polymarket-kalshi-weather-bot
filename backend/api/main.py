@@ -3,8 +3,8 @@ from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Dict, List, Optional
 import asyncio
 import json
 import os
@@ -19,7 +19,32 @@ from backend.core.signals import scan_for_signals, TradingSignal
 from backend.data.crypto_markets import fetch_active_crypto_markets, CryptoUpDownMarket
 from backend.data.crypto import fetch_crypto_price, compute_crypto_microstructure
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PlainSerializer
+
+
+# Slice D6.5: every datetime column in this project is stored as naive UTC
+# (scheduler/settlement/signal-gen all call datetime.utcnow()). Pydantic's
+# default JSON serializer emits naive ISO strings like
+# "2026-04-24T17:38:01.875164" — no 'Z', no offset. JavaScript's
+# `new Date()` parses such strings as LOCAL time, producing a UTC-offset
+# drift in every "time ago" display on the frontend. Annotated +
+# PlainSerializer fixes this at the serialization boundary: any field
+# typed as UTCDatetime is emitted with an explicit 'Z' suffix (or the
+# existing UTC offset, normalized to 'Z', for tz-aware inputs). The DB
+# schema is untouched; request parsing is untouched; only response
+# serialization changes.
+def _serialize_utc_z(value: datetime) -> str:
+    if value.tzinfo is None:
+        return value.isoformat() + "Z"
+    # Tz-aware: normalize to UTC and emit 'Z' rather than '+00:00' so
+    # every timestamp in the API has identical shape.
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+UTCDatetime = Annotated[
+    datetime,
+    PlainSerializer(_serialize_utc_z, return_type=str, when_used="json"),
+]
 
 app = FastAPI(
     title="BTC 5-Min Trading Bot",
@@ -67,7 +92,7 @@ class BtcPriceResponse(BaseModel):
     change_7d: float
     market_cap: float
     volume_24h: float
-    last_updated: datetime
+    last_updated: UTCDatetime
 
 
 class BtcWindowResponse(BaseModel):
@@ -75,8 +100,8 @@ class BtcWindowResponse(BaseModel):
     market_id: str
     up_price: float
     down_price: float
-    window_start: datetime
-    window_end: datetime
+    window_start: UTCDatetime
+    window_end: UTCDatetime
     volume: float
     is_active: bool
     is_upcoming: bool
@@ -107,12 +132,12 @@ class SignalResponse(BaseModel):
     confidence: float
     suggested_size: float
     reasoning: str
-    timestamp: datetime
+    timestamp: UTCDatetime
     category: str = "crypto"
     event_slug: Optional[str] = None
     underlying_price: float = 0.0
     underlying_change_24h: float = 0.0
-    window_end: Optional[datetime] = None
+    window_end: Optional[UTCDatetime] = None
     actionable: bool = False
     # Slice D2: multi-strategy attribution fields. Populated from either the
     # live TradingSignal.underlying (BTC brain path) or the Signal DB row
@@ -130,7 +155,7 @@ class TradeResponse(BaseModel):
     direction: str
     entry_price: float
     size: float
-    timestamp: datetime
+    timestamp: UTCDatetime
     settled: bool
     result: str
     pnl: Optional[float]
@@ -149,7 +174,7 @@ class BotStats(BaseModel):
     win_rate: float
     total_pnl: float
     is_running: bool
-    last_run: Optional[datetime]
+    last_run: Optional[UTCDatetime]
 
 
 class CalibrationBucket(BaseModel):
@@ -222,8 +247,8 @@ class PerAssetStats(BaseModel):
     win_rate: Optional[float] = None
     total_pnl: float
     pnl_24h: float
-    last_signal_time: Optional[datetime] = None
-    last_trade_time: Optional[datetime] = None
+    last_signal_time: Optional[UTCDatetime] = None
+    last_trade_time: Optional[UTCDatetime] = None
 
 
 class McOpenPosition(BaseModel):
@@ -234,8 +259,8 @@ class McOpenPosition(BaseModel):
     entry_price: float
     size: float
     model_probability: float
-    timestamp: datetime
-    expected_settlement: Optional[datetime] = None
+    timestamp: UTCDatetime
+    expected_settlement: Optional[UTCDatetime] = None
 
 
 class McPortfolioStatus(BaseModel):
@@ -246,7 +271,7 @@ class McPortfolioStatus(BaseModel):
     total_allocated: float
     signals_last_24h: int
     actionable_signals_last_24h: int
-    next_scheduled_scan: Optional[datetime] = None
+    next_scheduled_scan: Optional[UTCDatetime] = None
 
 
 class DashboardData(BaseModel):
@@ -266,7 +291,12 @@ class DashboardData(BaseModel):
 
 
 class EventResponse(BaseModel):
-    timestamp: str
+    # Slice D6.5: was str, now UTCDatetime so Pydantic parses the
+    # scheduler's naive ISO string at construction time and re-emits with
+    # a 'Z' suffix — matches every other datetime on the wire. The
+    # scheduler's log_event still produces naive ISO; we convert at the
+    # API boundary, not at the source.
+    timestamp: UTCDatetime
     type: str
     message: str
     data: dict = {}
@@ -872,14 +902,19 @@ def _build_mc_portfolio_status(db: Session) -> McPortfolioStatus:
     )
 
     # Scheduler's next_run_time is only available if the job is registered.
+    # APScheduler returns a tz-aware datetime in the scheduler's local tz
+    # (on macOS: system tz, which for this project is EDT). Slice D2
+    # stripped tzinfo and treated the result as UTC, which added a silent
+    # local-offset lie (visible now that D6.5 normalizes to UTC at the
+    # serialization boundary). Pass the aware datetime through instead —
+    # the UTCDatetime serializer converts via astimezone(utc).
     next_scan: Optional[datetime] = None
     try:
         from backend.core.scheduler import scheduler as _sched
         if _sched is not None:
             job = _sched.get_job("mc_scan")
             if job is not None and job.next_run_time is not None:
-                nrt = job.next_run_time
-                next_scan = nrt.replace(tzinfo=None) if nrt.tzinfo else nrt
+                next_scan = job.next_run_time
     except Exception:
         next_scan = None
 

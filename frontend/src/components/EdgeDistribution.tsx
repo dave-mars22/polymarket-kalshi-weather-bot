@@ -1,10 +1,9 @@
 import { useMemo } from 'react'
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts'
-import type { Signal, WeatherSignal } from '../types'
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
+import type { Signal } from '../types'
 
 interface Props {
   btcSignals: Signal[]
-  weatherSignals: WeatherSignal[]
 }
 
 const BUCKETS = ['0-2%', '2-5%', '5-10%', '10-20%', '20%+']
@@ -32,30 +31,23 @@ const CustomTooltip = ({ active, payload, label }: any) => {
   )
 }
 
-export function EdgeDistribution({ btcSignals, weatherSignals }: Props) {
+export function EdgeDistribution({ btcSignals }: Props) {
   const data = useMemo(() => {
-    const counts: Record<string, { btc: number; weather: number }> = {}
-    BUCKETS.forEach(b => { counts[b] = { btc: 0, weather: 0 } })
+    const counts: Record<string, number> = {}
+    BUCKETS.forEach(b => { counts[b] = 0 })
 
     btcSignals.forEach(s => {
       const bucket = getBucket(s.edge)
-      counts[bucket].btc++
-    })
-
-    weatherSignals.forEach(s => {
-      const bucket = getBucket(s.edge)
-      counts[bucket].weather++
+      counts[bucket]++
     })
 
     return BUCKETS.map(bucket => ({
       bucket,
-      BTC: counts[bucket].btc,
-      WX: counts[bucket].weather,
+      BTC: counts[bucket],
     }))
-  }, [btcSignals, weatherSignals])
+  }, [btcSignals])
 
-  const total = btcSignals.length + weatherSignals.length
-  if (total === 0) {
+  if (btcSignals.length === 0) {
     return (
       <div className="h-full flex items-center justify-center text-neutral-600 text-[10px]">
         No signals for distribution
@@ -85,12 +77,7 @@ export function EdgeDistribution({ btcSignals, weatherSignals }: Props) {
             fontFamily="JetBrains Mono"
           />
           <Tooltip content={<CustomTooltip />} />
-          <Legend
-            iconSize={8}
-            wrapperStyle={{ fontSize: '9px', fontFamily: 'JetBrains Mono' }}
-          />
-          <Bar dataKey="BTC" stackId="a" fill="#d97706" radius={[0, 0, 0, 0]} />
-          <Bar dataKey="WX" stackId="a" fill="#06b6d4" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="BTC" fill="#d97706" radius={[2, 2, 0, 0]} />
         </BarChart>
       </ResponsiveContainer>
     </div>

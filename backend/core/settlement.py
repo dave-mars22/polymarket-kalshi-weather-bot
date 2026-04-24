@@ -1,4 +1,4 @@
-"""Trade settlement logic for BTC 5-min and weather markets using Polymarket API."""
+"""Trade settlement logic for BTC 5-min markets using Polymarket API, with Kalshi resolution helper for future reuse."""
 import httpx
 import json
 import logging
@@ -177,28 +177,6 @@ async def check_market_settlement(trade: Trade) -> Tuple[bool, Optional[float], 
     return True, settlement_value, pnl
 
 
-async def check_weather_settlement(trade: Trade) -> Tuple[bool, Optional[float], Optional[float]]:
-    """
-    Check if a weather trade's market has settled.
-    Routes to the correct platform's resolution method.
-    """
-    platform = getattr(trade, 'platform', 'polymarket') or 'polymarket'
-
-    if platform == "kalshi":
-        is_resolved, settlement_value = await _fetch_kalshi_resolution(trade.market_ticker)
-    else:
-        is_resolved, settlement_value = await fetch_polymarket_resolution(
-            trade.market_ticker,
-            event_slug=trade.event_slug,
-        )
-
-    if is_resolved and settlement_value is not None:
-        pnl = calculate_pnl(trade, settlement_value)
-        return True, settlement_value, pnl
-
-    return False, None, None
-
-
 async def _fetch_kalshi_resolution(ticker: str) -> Tuple[bool, Optional[float]]:
     """Fetch resolution status for a Kalshi market."""
     try:
@@ -247,12 +225,7 @@ async def settle_pending_trades(db: Session) -> List[Trade]:
 
     for trade in pending:
         try:
-            # Route settlement by market type
-            market_type = getattr(trade, 'market_type', 'btc') or 'btc'
-            if market_type == "weather":
-                is_settled, settlement_value, pnl = await check_weather_settlement(trade)
-            else:
-                is_settled, settlement_value, pnl = await check_market_settlement(trade)
+            is_settled, settlement_value, pnl = await check_market_settlement(trade)
 
             if is_settled and settlement_value is not None:
                 trade.settled = True

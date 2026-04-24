@@ -53,7 +53,7 @@ class ClaudeAnalyzer(BaseAIClient):
 
         Args:
             signal_data: Signal information (ticker, edge, probabilities, etc.)
-            context: Additional context (weather data, crypto prices, etc.)
+            context: Additional context (crypto prices, etc.)
 
         Returns:
             AIAnalysis with reasoning and confidence
@@ -207,7 +207,7 @@ class ClaudeAnalyzer(BaseAIClient):
 
 Title: {title}
 
-Categories: weather, crypto, politics, economics, sports, other"""
+Categories: crypto, politics, economics, sports, other"""
 
             message = client.messages.create(
                 model=self.model,
@@ -256,7 +256,7 @@ Categories: weather, crypto, politics, economics, sports, other"""
                 pass
 
             # Map response to category
-            valid_categories = ["weather", "crypto", "politics", "economics", "sports", "other"]
+            valid_categories = ["crypto", "politics", "economics", "sports", "other"]
             for cat in valid_categories:
                 if cat in response:
                     return (cat, 0.8)

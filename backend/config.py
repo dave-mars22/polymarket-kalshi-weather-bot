@@ -64,18 +64,9 @@ class Settings(BaseSettings):
     # Volume filter
     MIN_MARKET_VOLUME: float = 100.0  # Low volume for 5-min markets
 
-    # Weather trading settings
-    WEATHER_ENABLED: bool = True
-    WEATHER_SCAN_INTERVAL_SECONDS: int = 300  # 5 min
-    WEATHER_SETTLEMENT_INTERVAL_SECONDS: int = 1800  # 30 min
-    WEATHER_MIN_EDGE_THRESHOLD: float = 0.08  # 8% — weather has more signal than 5-min BTC
     # Slippage (basis points) used by fee-aware edge math
     BTC_SLIPPAGE_BPS: int = 10      # 0.10% slippage per side for BTC/Polymarket
-    WEATHER_SLIPPAGE_BPS: int = 50  # 0.50% slippage per side for weather markets
-    WEATHER_MIN_ENSEMBLE_AGREEMENT: float = 0.85  # Require >=85% of ensemble members to agree
-    WEATHER_MAX_ENTRY_PRICE: float = 0.70
-    WEATHER_MAX_TRADE_SIZE: float = 100.0
-    WEATHER_CITIES: str = "nyc,chicago,miami,los_angeles,denver"
+    KALSHI_SLIPPAGE_BPS: int = 50   # 0.50% slippage per side for Kalshi markets
 
     class Config:
         env_file = ".env"

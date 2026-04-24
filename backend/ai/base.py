@@ -111,14 +111,6 @@ Direction: {signal_data.get('direction', 'Unknown').upper()}
 """
 
     if context:
-        if 'weather_data' in context:
-            wd = context['weather_data']
-            prompt += f"""
-Weather Context:
-- High Temperature Forecast: {wd.get('high_temp', 'N/A')}°F
-- Ensemble Agreement: {wd.get('confidence', 0):.0%}
-- Number of Models: {wd.get('ensemble_count', 'N/A')}
-"""
         if 'crypto_data' in context:
             cd = context['crypto_data']
             prompt += f"""
@@ -147,7 +139,6 @@ Title: {title}
 Description: {description or 'N/A'}
 
 Categories:
-- weather: Temperature, precipitation, climate events
 - crypto: Cryptocurrency prices, blockchain events
 - politics: Elections, legislation, government actions
 - economics: Inflation, GDP, employment, Fed decisions

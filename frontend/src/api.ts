@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { DashboardData, Signal, Trade, BotStats, BtcPrice, BtcWindow, WeatherForecast, WeatherSignal } from './types'
+import type { DashboardData, Signal, Trade, BotStats, BtcPrice, BtcWindow } from './types'
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
@@ -69,12 +69,3 @@ export async function resetBot(): Promise<{ status: string; trades_deleted: numb
   return data
 }
 
-export async function fetchWeatherForecasts(): Promise<WeatherForecast[]> {
-  const { data } = await api.get<WeatherForecast[]>('/weather/forecasts')
-  return data
-}
-
-export async function fetchWeatherSignals(): Promise<WeatherSignal[]> {
-  const { data } = await api.get<WeatherSignal[]>('/weather/signals')
-  return data
-}

@@ -123,7 +123,7 @@ class GroqClassifier(BaseAIClient):
                     pass
 
             # Validate category
-            valid_categories = ["weather", "crypto", "politics", "economics", "sports", "other"]
+            valid_categories = ["crypto", "politics", "economics", "sports", "other"]
             if category not in valid_categories:
                 # Try to find a valid category in the response
                 for cat in valid_categories:

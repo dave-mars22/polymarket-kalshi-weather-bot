@@ -26,7 +26,7 @@ class Trade(Base):
     market_ticker = Column(String, index=True)
     platform = Column(String)
     event_slug = Column(String, nullable=True)
-    market_type = Column(String, default="btc", index=True)  # "btc" or "weather"
+    market_type = Column(String, default="btc", index=True)  # "btc" or "monte_carlo"
 
     # Trade details
     direction = Column(String)  # "up" or "down"
@@ -77,7 +77,7 @@ class Signal(Base):
     id = Column(Integer, primary_key=True, index=True)
     market_ticker = Column(String, index=True)
     platform = Column(String)
-    market_type = Column(String, default="btc", index=True)  # "btc" or "weather"
+    market_type = Column(String, default="btc", index=True)  # "btc" or "monte_carlo"
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
     direction = Column(String)

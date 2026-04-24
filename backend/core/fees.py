@@ -9,8 +9,8 @@ Sources:
 - Kalshi fee schedule: https://kalshi.com/docs/fees
   Formula: fee = ceil(0.07 * contracts * price * (1 - price) * 100) / 100
   This is asymmetric and peaks at price = 0.50.
-- Polymarket: 0% maker/taker on most markets as of 2026, but thin depth on
-  weather markets causes real slippage. We model slippage as a flat bps cost.
+- Polymarket: 0% maker/taker on most markets as of 2026. We model slippage
+  as a flat bps cost to account for thin depth on some markets.
 """
 from __future__ import annotations
 
@@ -94,8 +94,7 @@ class KalshiFeeModel(FeeModel):
 class PolymarketFeeModel(FeeModel):
     """
     Polymarket currently charges 0% maker/taker on most markets. We still
-    model slippage (weather market depth is thin) and a small gas allowance
-    for on-chain settlement.
+    model slippage and a small gas allowance for on-chain settlement.
     """
 
     def __init__(
@@ -125,14 +124,14 @@ class PolymarketFeeModel(FeeModel):
 def get_fee_model(
     venue: Venue,
     btc_slippage_bps: int = 10,
-    weather_slippage_bps: int = 50,
-    market_type: str = "weather",
+    kalshi_slippage_bps: int = 50,
+    market_type: str = "btc",
 ) -> FeeModel:
     """
     Build the right fee model. BTC 5-min markets have tighter books than
-    weather, so slippage defaults differ.
+    Kalshi markets, so slippage defaults differ.
     """
-    slippage = btc_slippage_bps if market_type == "btc" else weather_slippage_bps
+    slippage = btc_slippage_bps if market_type == "btc" else kalshi_slippage_bps
     if venue == "kalshi":
         return KalshiFeeModel(slippage_bps=slippage)
     if venue == "polymarket":
@@ -146,9 +145,9 @@ def net_edge(
     entry_price: float,
     size_usd: float,
     venue: Venue,
-    market_type: str = "weather",
+    market_type: str = "btc",
     btc_slippage_bps: int = 10,
-    weather_slippage_bps: int = 50,
+    kalshi_slippage_bps: int = 50,
 ) -> tuple[float, float, FeeBreakdown]:
     """
     Returns (raw_edge, net_edge, fee_breakdown).
@@ -165,7 +164,7 @@ def net_edge(
     fee_model = get_fee_model(
         venue,
         btc_slippage_bps=btc_slippage_bps,
-        weather_slippage_bps=weather_slippage_bps,
+        kalshi_slippage_bps=kalshi_slippage_bps,
         market_type=market_type,
     )
     costs = fee_model.estimate_round_trip_cost(entry_price, size_usd)

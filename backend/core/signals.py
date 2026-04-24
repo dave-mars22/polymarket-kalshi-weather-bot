@@ -209,7 +209,7 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
         venue="polymarket",
         market_type="btc",
         btc_slippage_bps=settings.BTC_SLIPPAGE_BPS,
-        weather_slippage_bps=settings.WEATHER_SLIPPAGE_BPS,
+        kalshi_slippage_bps=settings.KALSHI_SLIPPAGE_BPS,
     )
     fee_cost = fee_breakdown.total
 

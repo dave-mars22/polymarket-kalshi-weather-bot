@@ -1,4 +1,4 @@
-import { useState, useEffect, Suspense, lazy } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { fetchDashboard, runScan, simulateTrade, startBot, stopBot } from './api'
@@ -9,12 +9,9 @@ import { EquityChart } from './components/EquityChart'
 import { Terminal } from './components/Terminal'
 import { MicrostructurePanel } from './components/MicrostructurePanel'
 import { CalibrationPanel } from './components/CalibrationPanel'
-import { WeatherPanel } from './components/WeatherPanel'
 import { EdgeDistribution } from './components/EdgeDistribution'
 import { formatCountdown } from './utils'
 import type { BtcWindow } from './types'
-
-const GlobeView = lazy(() => import('./components/GlobeView').then(m => ({ default: m.GlobeView })))
 
 function LiveClock() {
   const [time, setTime] = useState(new Date())
@@ -104,8 +101,6 @@ function App() {
   const btcPrice = data?.btc_price
   const micro = data?.microstructure
   const windows = data?.windows ?? []
-  const weatherSignals = data?.weather_signals ?? []
-  const weatherForecasts = data?.weather_forecasts ?? []
 
   const stats = data?.stats ?? {
     is_running: false,
@@ -119,7 +114,7 @@ function App() {
   const equityCurve = data?.equity_curve ?? []
   const calibration = data?.calibration ?? null
 
-  const actionableCount = activeSignals.filter(s => s.actionable).length + weatherSignals.filter(s => s.actionable).length
+  const actionableCount = activeSignals.filter(s => s.actionable).length
 
   if (isLoading) {
     return (
@@ -267,63 +262,30 @@ function App() {
 
         {/* ===== CENTER COLUMN ===== */}
         <div className="flex flex-col min-h-0 border-r border-neutral-800">
-          {/* Globe - top 60% */}
-          <div className="relative" style={{ height: '58%' }}>
-            <div className="absolute inset-0">
-              <Suspense fallback={
-                <div className="w-full h-full flex items-center justify-center bg-black">
-                  <span className="text-[10px] text-neutral-600 uppercase tracking-wider">Loading Globe...</span>
-                </div>
-              }>
-                <GlobeView forecasts={weatherForecasts} signals={weatherSignals} />
-              </Suspense>
+          {/* Edge Distribution - top half */}
+          <div className="flex flex-col min-h-0 border-b border-neutral-800" style={{ height: '50%' }}>
+            <div className="px-2 py-1 border-b border-neutral-800 flex items-center justify-between shrink-0">
+              <span className="text-[10px] text-neutral-500 uppercase tracking-wider">Edge Distribution</span>
+              <span className="text-[10px] text-amber-500 tabular-nums">{actionableCount} actionable</span>
             </div>
-            {/* Globe overlay: actionable count */}
-            <div className="absolute top-2 left-2 z-10">
-              <div className="px-2 py-1 bg-black/80 border border-neutral-800 text-[10px]">
-                <span className="text-neutral-500 uppercase tracking-wider mr-2">Markets</span>
-                <span className="text-amber-500 tabular-nums">{actionableCount} actionable</span>
-              </div>
+            <div className="flex-1 min-h-0 p-1">
+              <EdgeDistribution btcSignals={activeSignals} />
             </div>
           </div>
 
-          {/* Bottom panels - 3 side by side */}
-          <div className="flex-1 min-h-0 grid grid-cols-3 border-t border-neutral-800">
-            {/* Edge Distribution */}
-            <div className="border-r border-neutral-800 flex flex-col min-h-0">
-              <div className="px-2 py-1 border-b border-neutral-800 shrink-0">
-                <span className="text-[10px] text-neutral-500 uppercase tracking-wider">Edge Distribution</span>
-              </div>
-              <div className="flex-1 min-h-0 p-1">
-                <EdgeDistribution btcSignals={activeSignals} weatherSignals={weatherSignals} />
-              </div>
+          {/* BTC Windows - bottom half */}
+          <div className="flex flex-col min-h-0 flex-1">
+            <div className="px-2 py-1 border-b border-neutral-800 shrink-0">
+              <span className="text-[10px] text-neutral-500 uppercase tracking-wider">BTC Windows</span>
             </div>
-
-            {/* BTC Windows */}
-            <div className="border-r border-neutral-800 flex flex-col min-h-0">
-              <div className="px-2 py-1 border-b border-neutral-800 shrink-0">
-                <span className="text-[10px] text-neutral-500 uppercase tracking-wider">BTC Windows</span>
-              </div>
-              <div className="flex-1 min-h-0 overflow-y-auto p-1 space-y-1">
-                {windows.length > 0 ? (
-                  windows.slice(0, 10).map(w => (
-                    <WindowPill key={w.slug} window={w} />
-                  ))
-                ) : (
-                  <div className="text-[10px] text-neutral-600 p-2">No active windows</div>
-                )}
-              </div>
-            </div>
-
-            {/* Weather Forecasts */}
-            <div className="flex flex-col min-h-0">
-              <div className="px-2 py-1 border-b border-neutral-800 flex items-center justify-between shrink-0">
-                <span className="text-[10px] text-neutral-500 uppercase tracking-wider">Weather</span>
-                <span className="px-1 py-0.5 text-[8px] font-bold uppercase bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">WX</span>
-              </div>
-              <div className="flex-1 min-h-0 overflow-y-auto">
-                <WeatherPanel forecasts={weatherForecasts} signals={weatherSignals} />
-              </div>
+            <div className="flex-1 min-h-0 overflow-y-auto p-1 space-y-1">
+              {windows.length > 0 ? (
+                windows.slice(0, 20).map(w => (
+                  <WindowPill key={w.slug} window={w} />
+                ))
+              ) : (
+                <div className="text-[10px] text-neutral-600 p-2">No active windows</div>
+              )}
             </div>
           </div>
         </div>
@@ -334,17 +296,11 @@ function App() {
           <div className="flex flex-col min-h-0" style={{ height: '50%' }}>
             <div className="px-2 py-1 border-b border-neutral-800 flex items-center justify-between shrink-0">
               <span className="text-[10px] text-neutral-500 uppercase tracking-wider">Signals</span>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] text-amber-400 tabular-nums">{activeSignals.length} BTC</span>
-                {weatherSignals.length > 0 && (
-                  <span className="text-[10px] text-cyan-400 tabular-nums">{weatherSignals.length} WX</span>
-                )}
-              </div>
+              <span className="text-[10px] text-amber-400 tabular-nums">{activeSignals.length} BTC</span>
             </div>
             <div className="flex-1 overflow-y-auto min-h-0">
               <SignalsTable
                 signals={activeSignals}
-                weatherSignals={weatherSignals}
                 onSimulateTrade={(ticker) => tradeMutation.mutate(ticker)}
                 isSimulating={tradeMutation.isPending}
               />
@@ -367,11 +323,11 @@ function App() {
       {/* ===== FOOTER ===== */}
       <footer className="shrink-0 border-t border-neutral-800 px-3 py-0.5 flex items-center justify-between">
         <span className="text-[10px] text-neutral-700 font-mono">
-          Binance/Coinbase | Open-Meteo | Polymarket + Kalshi
+          Binance/Coinbase | Polymarket
         </span>
         <div className="flex items-center gap-3">
           <RefreshBar interval={10000} />
-          <span className="text-[10px] text-neutral-700 font-mono">BTC 5-min + Weather Temp</span>
+          <span className="text-[10px] text-neutral-700 font-mono">BTC 5-min</span>
           <div className="flex items-center gap-1">
             <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
             <span className="text-[10px] text-neutral-600 font-mono">Connected</span>

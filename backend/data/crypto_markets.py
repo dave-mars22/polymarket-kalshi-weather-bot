@@ -27,6 +27,9 @@ _SLUG_TEMPLATES: dict[str, Tuple[str, Pattern]] = {
     # the exact `{asset}-updown-5m-{unix_ts}` pattern and identical event
     # structure (outcomes=['Up','Down'], 10-digit ts, same market shape).
     "ETH": ("eth-updown-5m-", re.compile(r"^eth-updown-5m-\d{10}$")),
+    # SOL + XRP added in slice 3d; identical pattern verified live in 3b.
+    "SOL": ("sol-updown-5m-", re.compile(r"^sol-updown-5m-\d{10}$")),
+    "XRP": ("xrp-updown-5m-", re.compile(r"^xrp-updown-5m-\d{10}$")),
 }
 
 

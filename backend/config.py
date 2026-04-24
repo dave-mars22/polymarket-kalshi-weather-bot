@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     # Comma-separated underlyings to scan. Parsed at scan time; asset-
     # agnostic signal logic so adding/removing entries is cheap. Slice
     # 3c adds ETH; 3d adds SOL + XRP after live verification.
-    CRYPTO_TECH_UNDERLYINGS: str = "BTC,ETH"
+    CRYPTO_TECH_UNDERLYINGS: str = "BTC,ETH,SOL,XRP"
 
     class Config:
         env_file = ".env"

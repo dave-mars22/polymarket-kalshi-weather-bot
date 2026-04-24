@@ -31,7 +31,10 @@ class Settings(BaseSettings):
     # Bot settings - BTC 5-MIN TRADING
     SIMULATION_MODE: bool = True
     INITIAL_BANKROLL: float = 10000.0
-    KELLY_FRACTION: float = 0.15  # Fractional Kelly
+    KELLY_FRACTION: float = 0.10  # Fractional Kelly
+    # Change 3: Calibration-adjusted Kelly
+    MIN_TRADES_FOR_CALIBRATION: int = 100  # Trades needed before trusting calibration
+    CALIBRATION_MAX_MULTIPLIER: float = 0.7  # Cap on Kelly scale-up
 
     # BTC 5-min specific settings
     SCAN_INTERVAL_SECONDS: int = 60  # Scan every minute
@@ -41,6 +44,9 @@ class Settings(BaseSettings):
     MAX_ENTRY_PRICE: float = 0.55  # Enter up to 55c
     MAX_TRADES_PER_WINDOW: int = 1
     MAX_TOTAL_PENDING_TRADES: int = 20
+
+    # Signal gates (Change 2a — tighter convergence)
+    USE_STRICT_CONVERGENCE: bool = True
 
     # Risk management
     DAILY_LOSS_LIMIT: float = 300.0
@@ -63,6 +69,10 @@ class Settings(BaseSettings):
     WEATHER_SCAN_INTERVAL_SECONDS: int = 300  # 5 min
     WEATHER_SETTLEMENT_INTERVAL_SECONDS: int = 1800  # 30 min
     WEATHER_MIN_EDGE_THRESHOLD: float = 0.08  # 8% — weather has more signal than 5-min BTC
+    # Slippage (basis points) used by fee-aware edge math
+    BTC_SLIPPAGE_BPS: int = 10      # 0.10% slippage per side for BTC/Polymarket
+    WEATHER_SLIPPAGE_BPS: int = 50  # 0.50% slippage per side for weather markets
+    WEATHER_MIN_ENSEMBLE_AGREEMENT: float = 0.85  # Require >=85% of ensemble members to agree
     WEATHER_MAX_ENTRY_PRICE: float = 0.70
     WEATHER_MAX_TRADE_SIZE: float = 100.0
     WEATHER_CITIES: str = "nyc,chicago,miami,los_angeles,denver"

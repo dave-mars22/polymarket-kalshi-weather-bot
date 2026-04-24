@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 import asyncio
 
 from backend.config import settings
+from backend.core.fees import net_edge
+from backend.core.calibration import get_calibration_multiplier
 from backend.data.btc_markets import BtcMarket, fetch_active_btc_markets
 from backend.data.crypto import fetch_crypto_price, compute_btc_microstructure
 from backend.models.database import SessionLocal, Signal
@@ -21,7 +23,10 @@ class TradingSignal:
     # Core signal data
     model_probability: float = 0.5  # Our estimated probability of UP
     market_probability: float = 0.5  # Market's implied UP probability
-    edge: float = 0.0
+    edge: float = 0.0                # Equals net_edge; kept for backward compat
+    raw_edge: float = 0.0            # Before fees (for dashboard/debug)
+    net_edge: float = 0.0            # After fees (used for gating)
+    fee_cost: float = 0.0            # Dollar cost of fees + slippage
     direction: str = "up"  # "up" or "down"
 
     # Confidence and sizing
@@ -41,28 +46,16 @@ class TradingSignal:
 
     @property
     def passes_threshold(self) -> bool:
-        """Check if signal passes minimum edge threshold."""
-        return abs(self.edge) >= settings.MIN_EDGE_THRESHOLD
+        """Check if signal passes minimum edge threshold (after fees)."""
+        return abs(self.net_edge) >= settings.MIN_EDGE_THRESHOLD
 
 
 def calculate_edge(
     model_prob: float,
     market_price: float
 ) -> tuple[float, str]:
-    """
-    Calculate edge and determine direction.
-
-    For BTC 5-min markets:
-    - "up" is equivalent to "yes" (outcomePrices[0])
-    - "down" is equivalent to "no" (outcomePrices[1])
-
-    Returns:
-        (edge, direction) where direction is "up" or "down"
-    """
-    # Edge for UP bet
+    """Calculate edge and determine direction."""
     up_edge = model_prob - market_price
-
-    # Edge for DOWN bet
     down_edge = (1 - model_prob) - (1 - market_price)
 
     if up_edge >= down_edge:
@@ -78,16 +71,7 @@ def calculate_kelly_size(
     direction: str,
     bankroll: float
 ) -> float:
-    """
-    Calculate position size using fractional Kelly criterion.
-
-    Kelly formula: f = (p * b - q) / b
-    where:
-        f = fraction of bankroll to bet
-        p = probability of winning
-        q = probability of losing (1 - p)
-        b = odds (payout ratio)
-    """
+    """Calculate position size using fractional Kelly criterion."""
     if direction == "up":
         win_prob = probability
         price = market_price
@@ -99,22 +83,15 @@ def calculate_kelly_size(
         return 0
 
     odds = (1 - price) / price
-
     lose_prob = 1 - win_prob
     kelly = (win_prob * odds - lose_prob) / odds
-
-    # Apply fractional Kelly
     kelly *= settings.KELLY_FRACTION
 
-    # Cap at maximum per-trade limit
-    max_fraction = 0.05  # 5% max per trade
+    max_fraction = 0.05
     kelly = min(kelly, max_fraction)
-
     kelly = max(kelly, 0)
 
     size = kelly * bankroll
-
-    # Hard cap from config
     size = min(size, settings.MAX_TRADE_SIZE)
 
     return size
@@ -124,11 +101,13 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
     """
     Generate a trading signal for a BTC 5-min Up/Down market.
 
-    Uses real 1-minute candle data from Binance to compute:
-    - RSI (mean reversion), Momentum (trend), VWAP deviation,
-      SMA crossover, and market skew as a weighted composite.
-    - Convergence filter: requires 3/4 indicators to agree.
-    - Entry price filter: only enter when price ≤ MAX_ENTRY_PRICE.
+    Gates (Change 2a — tighter):
+    - Convergence: 3-of-5 indicators must agree on direction (was 2-of-4)
+    - RSI neutrality filter: reject if |RSI - 50| < 5 (pure noise zone)
+    - Momentum floor: at least one window must show |change| > 0.1%
+    - Fee-adjusted edge: trade only if NET edge >= threshold
+    - Entry price filter: only enter when price <= MAX_ENTRY_PRICE
+    - Time window filter: MIN_TIME_REMAINING <= time_left <= MAX_TIME_REMAINING
     """
     try:
         micro = await compute_btc_microstructure()
@@ -141,57 +120,62 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
 
     market_up_prob = market.up_price
 
-    # Skip resolved markets
     if market_up_prob < 0.02 or market_up_prob > 0.98:
         return None
 
-    # --- Entry price filter: only trade when price ≤ 50c ---
-    entry_price = market_up_prob  # will be overridden per-direction below
-    # We check after direction is determined
+    # --- Individual indicator signals ---
 
-    # --- Individual indicator signals (each returns a bias from -1 to +1) ---
-
-    # 1) RSI: mean reversion — oversold (< 30) = UP, overbought (> 70) = DOWN
+    # 1) RSI
     if micro.rsi < 30:
-        rsi_signal = 0.5 + (30 - micro.rsi) / 30  # 0.5 to 1.0
+        rsi_signal = 0.5 + (30 - micro.rsi) / 30
     elif micro.rsi > 70:
-        rsi_signal = -0.5 - (micro.rsi - 70) / 30  # -0.5 to -1.0
+        rsi_signal = -0.5 - (micro.rsi - 70) / 30
     elif micro.rsi < 45:
-        rsi_signal = (45 - micro.rsi) / 30  # slight UP lean
+        rsi_signal = (45 - micro.rsi) / 30
     elif micro.rsi > 55:
-        rsi_signal = -(micro.rsi - 55) / 30  # slight DOWN lean
+        rsi_signal = -(micro.rsi - 55) / 30
     else:
         rsi_signal = 0.0
     rsi_signal = max(-1.0, min(1.0, rsi_signal))
 
-    # 2) Momentum: weighted blend of 1m, 5m, 15m changes
-    #    Positive momentum = UP bias
+    # 2) Momentum
     mom_blend = micro.momentum_1m * 0.5 + micro.momentum_5m * 0.35 + micro.momentum_15m * 0.15
-    # Normalise: ±0.1% is a strong 5-min signal for BTC
     momentum_signal = max(-1.0, min(1.0, mom_blend / 0.10))
 
-    # 3) VWAP deviation: price above VWAP = UP momentum, below = DOWN
+    # 3) VWAP deviation
     vwap_signal = max(-1.0, min(1.0, micro.vwap_deviation / 0.05))
 
-    # 4) SMA crossover: sma5 > sma15 = bullish
+    # 4) SMA crossover
     sma_signal = max(-1.0, min(1.0, micro.sma_crossover / 0.03))
 
-    # 5) Market skew: contrarian — if market says UP strongly, fade it
+    # 5) Market skew
     market_skew = market_up_prob - 0.50
     skew_signal = max(-1.0, min(1.0, -market_skew * 4))
 
-    # --- Convergence filter: count how many indicators agree on direction ---
+    # --- Convergence filter (Change 2a: now counts all 5 indicators, stricter) ---
     indicator_signs = [
         rsi_signal,
         momentum_signal,
         vwap_signal,
         sma_signal,
+        skew_signal,
     ]
     up_votes = sum(1 for s in indicator_signs if s > 0.05)
     down_votes = sum(1 for s in indicator_signs if s < -0.05)
 
-    # Convergence: require 2/4 indicators to agree — these are noisy 50/50 markets
-    has_convergence = up_votes >= 2 or down_votes >= 2
+    convergence_threshold = 3 if settings.USE_STRICT_CONVERGENCE else 2
+    has_convergence = up_votes >= convergence_threshold or down_votes >= convergence_threshold
+
+    # --- NEW: RSI neutrality filter ---
+    rsi_is_neutral = abs(micro.rsi - 50) < 5
+
+    # --- NEW: Momentum magnitude floor ---
+    max_momentum_mag = max(
+        abs(micro.momentum_1m),
+        abs(micro.momentum_5m),
+        abs(micro.momentum_15m),
+    )
+    momentum_has_signal = max_momentum_mag > 0.001
 
     # --- Weighted composite ---
     w = settings
@@ -203,39 +187,59 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
         + skew_signal * w.WEIGHT_MARKET_SKEW
     )
 
-    # Convert composite (-1..+1) to probability (0.35..0.65)
-    # Wider range lets us express real edge when indicators converge
     model_up_prob = 0.50 + composite * 0.15
     model_up_prob = max(0.35, min(0.65, model_up_prob))
 
-    # Calculate edge and direction
-    edge, direction = calculate_edge(model_up_prob, market_up_prob)
+    # Raw edge
+    raw_edge_val, direction = calculate_edge(model_up_prob, market_up_prob)
 
-    # --- Entry price filter: only buy the cheap side (≤ MAX_ENTRY_PRICE) ---
+    # Entry price
     if direction == "up":
         entry_price = market_up_prob
     else:
         entry_price = market.down_price
 
-    # Time-remaining filter: only trade windows in the sweet spot
+    # Fee-adjusted edge
+    trial_size = min(settings.MAX_TRADE_SIZE, settings.INITIAL_BANKROLL * 0.05)
+    _, net_edge_val, fee_breakdown = net_edge(
+        model_prob=model_up_prob,
+        market_prob=market_up_prob,
+        entry_price=entry_price if entry_price > 0 else 0.5,
+        size_usd=trial_size,
+        venue="polymarket",
+        market_type="btc",
+        btc_slippage_bps=settings.BTC_SLIPPAGE_BPS,
+        weather_slippage_bps=settings.WEATHER_SLIPPAGE_BPS,
+    )
+    fee_cost = fee_breakdown.total
+
+    # Time filter
     now = datetime.utcnow()
-    # Handle timezone-aware window_end
     window_end = market.window_end
     if window_end.tzinfo is not None:
         window_end = window_end.replace(tzinfo=None)
     time_remaining = (window_end - now).total_seconds()
     time_ok = settings.MIN_TIME_REMAINING <= time_remaining <= settings.MAX_TIME_REMAINING
 
-    passes_filters = has_convergence and entry_price <= settings.MAX_ENTRY_PRICE and time_ok
+    # Combined filter check
+    passes_filters = (
+        has_convergence
+        and not rsi_is_neutral
+        and momentum_has_signal
+        and entry_price <= settings.MAX_ENTRY_PRICE
+        and time_ok
+    )
 
-    # Zero out edge if filters fail (signal still returned for UI visibility)
+    edge = abs(net_edge_val) if raw_edge_val >= 0 else -abs(net_edge_val)
+
     if not passes_filters:
         edge = 0.0
+        net_edge_val = 0.0
+        raw_edge_val = 0.0
 
-    # Confidence: based on convergence strength + volatility
-    #   Low volatility = lower confidence (less movement expected)
+    # Confidence
     vol_factor = min(1.0, micro.volatility / 0.05) if micro.volatility > 0 else 0.5
-    convergence_strength = max(up_votes, down_votes) / 4.0
+    convergence_strength = max(up_votes, down_votes) / 5.0
     confidence = min(0.8, 0.3 + convergence_strength * 0.3 + abs(composite) * 0.2) * vol_factor
 
     # Kelly sizing
@@ -247,12 +251,19 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
         direction=direction,
         bankroll=bankroll,
     )
+    # Calibration-adjusted Kelly (Change 3): shrink sizing if model has been overconfident
+    calib_mult = get_calibration_multiplier("btc")
+    suggested_size *= calib_mult
 
     # Build reasoning
     filter_status = "ACTIONABLE" if passes_filters else "FILTERED"
     filter_reasons = []
     if not has_convergence:
-        filter_reasons.append(f"convergence {max(up_votes, down_votes)}/4 < 2")
+        filter_reasons.append(f"convergence {max(up_votes, down_votes)}/5 < {convergence_threshold}")
+    if rsi_is_neutral:
+        filter_reasons.append(f"RSI neutral ({micro.rsi:.0f}, needs |rsi-50|>=5)")
+    if not momentum_has_signal:
+        filter_reasons.append(f"momentum too weak (max={max_momentum_mag*100:.3f}%<0.1%)")
     if not time_ok:
         filter_reasons.append(f"time {time_remaining:.0f}s not in [{settings.MIN_TIME_REMAINING},{settings.MAX_TIME_REMAINING}]")
     if entry_price > settings.MAX_ENTRY_PRICE:
@@ -265,8 +276,8 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
         f"Mom5m:{micro.momentum_5m:+.3f}% VWAP:{micro.vwap_deviation:+.3f}% "
         f"SMA:{micro.sma_crossover:+.4f}% Vol:{micro.volatility:.4f}% | "
         f"Composite:{composite:+.3f} -> Model UP:{model_up_prob:.0%} vs Mkt:{market_up_prob:.0%} | "
-        f"Edge:{edge:+.1%} -> {direction.upper()} @ {entry_price:.0%} | "
-        f"Convergence:{max(up_votes, down_votes)}/4 | "
+        f"Raw edge:{raw_edge_val:+.1%} | Net edge:{edge:+.1%} (fees ${fee_cost:.2f}) -> {direction.upper()} @ {entry_price:.0%} | "
+        f"Convergence:{max(up_votes, down_votes)}/5 | "
         f"Window ends: {market.window_end.strftime('%H:%M UTC')}"
     )
 
@@ -275,6 +286,9 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
         model_probability=model_up_prob,
         market_probability=market_up_prob,
         edge=edge,
+        raw_edge=raw_edge_val,
+        net_edge=edge,
+        fee_cost=fee_cost,
         direction=direction,
         confidence=confidence,
         kelly_fraction=suggested_size / bankroll if bankroll > 0 else 0,
@@ -282,15 +296,13 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
         sources=[f"binance_microstructure_{micro.source}"],
         reasoning=reasoning,
         btc_price=micro.price,
-        btc_change_1h=micro.momentum_5m * 12,  # rough annualisation for display
-        btc_change_24h=micro.momentum_15m * 96,  # rough extrapolation for display
+        btc_change_1h=micro.momentum_5m * 12,
+        btc_change_24h=micro.momentum_15m * 96,
     )
 
 
 async def scan_for_signals() -> List[TradingSignal]:
-    """
-    Scan BTC 5-min markets and generate signals.
-    """
+    """Scan BTC 5-min markets and generate signals."""
     signals = []
 
     logger.info("=" * 50)
@@ -312,11 +324,8 @@ async def scan_for_signals() -> List[TradingSignal]:
         except Exception as e:
             logger.debug(f"Signal generation failed for {market.slug}: {e}")
 
-        # Small delay to avoid CoinGecko rate limits
-        # (only needed if we're making multiple calls - reuse first result)
         await asyncio.sleep(0.1)
 
-    # Sort by absolute edge (best opportunities first)
     signals.sort(key=lambda s: abs(s.edge), reverse=True)
 
     actionable = [s for s in signals if s.passes_threshold]
@@ -327,7 +336,6 @@ async def scan_for_signals() -> List[TradingSignal]:
         logger.info(f"  {signal.market.slug}")
         logger.info(f"    Edge: {signal.edge:+.1%} -> {signal.direction.upper()} @ ${signal.suggested_size:.2f}")
 
-    # Persist signals with non-zero edge to DB for calibration tracking
     _persist_signals(signals)
 
     return signals
@@ -342,7 +350,6 @@ def _persist_signals(signals: list):
     db = SessionLocal()
     try:
         for signal in to_save:
-            # Dedup: skip if we already logged this signal for this market window
             existing = db.query(Signal).filter(
                 Signal.market_ticker == signal.market.market_id,
                 Signal.timestamp >= signal.timestamp.replace(second=0, microsecond=0),

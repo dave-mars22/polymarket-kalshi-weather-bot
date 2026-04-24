@@ -84,7 +84,7 @@ async def scan_and_trade_job():
                 return
 
             MAX_TRADES_PER_SCAN = 2
-            MIN_TRADE_SIZE = 10
+            MIN_TRADE_SIZE = 1
             MAX_TRADE_FRACTION = 0.03  # 3% max per trade
             MAX_TOTAL_PENDING = settings.MAX_TOTAL_PENDING_TRADES
 
@@ -217,7 +217,7 @@ async def weather_scan_and_trade_job():
                 return
 
             MAX_TRADES_PER_SCAN = 3
-            MIN_TRADE_SIZE = 10
+            MIN_TRADE_SIZE = 1
             MAX_WEATHER_ALLOCATION = 500.0  # Max total exposure to weather markets
 
             # Check weather allocation limit

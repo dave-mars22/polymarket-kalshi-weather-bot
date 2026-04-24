@@ -106,6 +106,13 @@ class Settings(BaseSettings):
     # Concentration cap: max open MC positions per Kalshi series_ticker.
     MC_MAX_OPEN_PER_SERIES: int = 2
 
+    # === MULTI-CRYPTO TECHNICAL BRAIN ===
+    CRYPTO_TECH_ENABLED: bool = True
+    # Comma-separated underlyings to scan. Parsed at scan time; asset-
+    # agnostic signal logic so adding/removing entries is cheap. Slice
+    # 3c adds ETH; 3d adds SOL + XRP after live verification.
+    CRYPTO_TECH_UNDERLYINGS: str = "BTC,ETH"
+
     class Config:
         env_file = ".env"
 

@@ -23,6 +23,10 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 # Keys are upper-case underlying symbols.
 _SLUG_TEMPLATES: dict[str, Tuple[str, Pattern]] = {
     "BTC": ("btc-updown-5m-", re.compile(r"^btc-updown-5m-\d{10}$")),
+    # ETH added in slice 3c after live Gamma-API verification confirmed
+    # the exact `{asset}-updown-5m-{unix_ts}` pattern and identical event
+    # structure (outcomes=['Up','Down'], 10-digit ts, same market shape).
+    "ETH": ("eth-updown-5m-", re.compile(r"^eth-updown-5m-\d{10}$")),
 }
 
 

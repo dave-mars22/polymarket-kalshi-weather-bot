@@ -31,6 +31,10 @@ class TradingSignal:
     → underlying_* land in slice 3e alongside the frontend update.
     """
     market: CryptoUpDownMarket
+    # Populated by generate_crypto_tech_signal from its `underlying` arg.
+    # Used by the scheduler's per-asset trading guard (slice 3c/3d) and
+    # persisted on Trade rows (slice 3e).
+    underlying: str = "BTC"
 
     # Core signal data
     model_probability: float = 0.5  # Our estimated probability of UP
@@ -305,6 +309,7 @@ async def generate_crypto_tech_signal(
 
     return TradingSignal(
         market=market,
+        underlying=underlying,
         model_probability=model_up_prob,
         market_probability=market_up_prob,
         edge=edge,
@@ -324,36 +329,40 @@ async def generate_crypto_tech_signal(
 
 
 async def scan_for_signals() -> List[TradingSignal]:
-    """Scan crypto 5-min markets and generate signals.
+    """Scan crypto 5-min markets for every enabled underlying.
 
-    TODO(slice 3e): iterate over settings.CRYPTO_TECH_UNDERLYINGS instead
-    of hardcoding BTC. Kept BTC-only in 3a-2 so behavior is identical to
-    pre-refactor; the parameterization groundwork is in place.
+    Iterates settings.CRYPTO_TECH_UNDERLYINGS sequentially (parallel async
+    is a later optimization; sequential keeps cycle budget predictable and
+    respects per-exchange rate limits). Returns all signals in one list
+    with TradingSignal.underlying identifying the asset. Gated by
+    settings.CRYPTO_TECH_ENABLED; returns [] if disabled.
     """
-    signals = []
+    signals: List[TradingSignal] = []
+    if not settings.CRYPTO_TECH_ENABLED:
+        return signals
 
+    underlyings = [
+        u.strip().upper() for u in settings.CRYPTO_TECH_UNDERLYINGS.split(",") if u.strip()
+    ]
     logger.info("=" * 50)
-    logger.info("CRYPTO 5-MIN SCAN: Fetching markets from Polymarket...")
+    logger.info(f"CRYPTO 5-MIN SCAN: underlyings={underlyings}")
 
-    # TODO(slice 3e): loop over settings.CRYPTO_TECH_UNDERLYINGS
-    underlying = "BTC"
-    try:
-        markets = await fetch_active_crypto_markets(underlying)
-    except Exception as e:
-        logger.error(f"Failed to fetch {underlying} markets: {e}")
-        markets = []
-
-    logger.info(f"Found {len(markets)} active {underlying} 5-min markets")
-
-    for market in markets:
+    for underlying in underlyings:
         try:
-            signal = await generate_crypto_tech_signal(market, underlying)
-            if signal:
-                signals.append(signal)
+            markets = await fetch_active_crypto_markets(underlying)
         except Exception as e:
-            logger.debug(f"Signal generation failed for {market.slug}: {e}")
+            logger.error(f"Failed to fetch {underlying} markets: {e}")
+            continue
+        logger.info(f"Found {len(markets)} active {underlying} 5-min markets")
 
-        await asyncio.sleep(0.1)
+        for market in markets:
+            try:
+                signal = await generate_crypto_tech_signal(market, underlying)
+                if signal:
+                    signals.append(signal)
+            except Exception as e:
+                logger.debug(f"Signal generation failed for {market.slug}: {e}")
+            await asyncio.sleep(0.1)
 
     signals.sort(key=lambda s: abs(s.edge), reverse=True)
 

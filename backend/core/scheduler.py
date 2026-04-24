@@ -106,6 +106,17 @@ async def scan_and_trade_job():
 
             trades_executed = 0
             for signal in actionable[:MAX_TRADES_PER_SCAN]:
+                # TODO(slice 3e): remove this guard. Added in 3c so ETH
+                # (and later SOL/XRP) signals are generated and visible
+                # in scans but don't actually execute trades until
+                # multi-asset execution is wired end-to-end. If this
+                # guard is still here in 3e's integration test, the
+                # test will see non-BTC signals generated but zero
+                # non-BTC trades created — which is the tripwire for
+                # catching a forgotten removal.
+                if signal.underlying != "BTC":
+                    continue
+
                 # Check if we already have a trade for this market window
                 existing = db.query(Trade).filter(
                     Trade.event_slug == signal.market.slug,

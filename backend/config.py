@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     BTC_SLIPPAGE_BPS: int = 10      # 0.10% slippage per side for BTC/Polymarket
     KALSHI_SLIPPAGE_BPS: int = 50   # 0.50% slippage per side for Kalshi markets
 
+    # === MONTE CARLO BRAIN ===
+    # (full config batch lands when scheduler wires in; these two ship now
+    # because the data layer reads them directly)
+    MC_HISTORICAL_CACHE_SECONDS: int = 3600   # 1 h — vol barely moves intraday
+    MC_SPOT_CACHE_SECONDS: int = 30           # 30 s — fresh enough for daily markets
+
     class Config:
         env_file = ".env"
 

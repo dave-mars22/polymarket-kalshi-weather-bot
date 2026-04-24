@@ -47,8 +47,8 @@ export interface Signal {
   timestamp: string
   category: string
   event_slug?: string
-  btc_price: number
-  btc_change_24h: number
+  underlying_price: number
+  underlying_change_24h: number
   window_end?: string
   actionable: boolean
 }

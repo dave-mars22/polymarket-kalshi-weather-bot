@@ -104,19 +104,19 @@ async def scan_and_trade_job():
                 log_event("info", f"Max pending trades reached ({total_pending}/{MAX_TOTAL_PENDING})")
                 return
 
+            # Multi-asset trading enabled in slice 3e. Any crypto in
+            # settings.CRYPTO_TECH_UNDERLYINGS (BTC/ETH/SOL/XRP) can execute
+            # trades; the trade row records underlying_asset/asset_class for
+            # per-asset analytics and allocation queries.
+            #
+            # Note on historical data: the ~600 BTC trades created before
+            # slice 3e have underlying_asset=NULL. This is intentional —
+            # they all resolved with market_type="btc" which is sufficient
+            # for calibration. Do not backfill NULLs; multi-asset allocation
+            # queries (slice 3f) filter on underlying_asset IS NOT NULL to
+            # avoid mixing old and new rows.
             trades_executed = 0
             for signal in actionable[:MAX_TRADES_PER_SCAN]:
-                # TODO(slice 3e): remove this guard. Added in 3c so ETH
-                # (and later SOL/XRP) signals are generated and visible
-                # in scans but don't actually execute trades until
-                # multi-asset execution is wired end-to-end. If this
-                # guard is still here in 3e's integration test, the
-                # test will see non-BTC signals generated but zero
-                # non-BTC trades created — which is the tripwire for
-                # catching a forgotten removal.
-                if signal.underlying != "BTC":
-                    continue
-
                 # Check if we already have a trade for this market window
                 existing = db.query(Trade).filter(
                     Trade.event_slug == signal.market.slug,
@@ -143,6 +143,9 @@ async def scan_and_trade_job():
                     market_ticker=signal.market.market_id,
                     platform="polymarket",
                     event_slug=signal.market.slug,
+                    market_type="btc",              # calibration bucket; shared across all cryptos
+                    underlying_asset=signal.underlying,
+                    asset_class="crypto",
                     direction=signal.direction,
                     entry_price=entry_price,
                     size=trade_size,
@@ -167,14 +170,15 @@ async def scan_and_trade_job():
                 trades_executed += 1
 
                 log_event("trade",
-                    f"BTC {signal.direction.upper()} ${trade_size:.0f} @ {entry_price:.0%} | {signal.market.slug}",
+                    f"{signal.underlying} {signal.direction.upper()} ${trade_size:.0f} @ {entry_price:.0%} | {signal.market.slug}",
                     {
                         "slug": signal.market.slug,
+                        "underlying": signal.underlying,
                         "direction": signal.direction,
                         "size": trade_size,
                         "edge": signal.edge,
                         "entry_price": entry_price,
-                        "btc_price": signal.btc_price,
+                        "underlying_price": signal.underlying_price,
                     }
                 )
 
@@ -182,7 +186,7 @@ async def scan_and_trade_job():
             db.commit()
 
             if trades_executed > 0:
-                log_event("success", f"Executed {trades_executed} BTC trade(s)")
+                log_event("success", f"Executed {trades_executed} crypto trade(s)")
             else:
                 log_event("info", "No new trades executed")
 

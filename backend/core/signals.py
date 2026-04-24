@@ -26,9 +26,8 @@ class TradingSignal:
     """A trading signal for a crypto 5-min market.
 
     The underlying asset is identified by TradingSignal.underlying; the
-    market object is now a generic CryptoUpDownMarket (same shape
-    regardless of BTC/ETH/SOL/XRP). Field renames btc_price/btc_change_*
-    → underlying_* land in slice 3e alongside the frontend update.
+    market object is a generic CryptoUpDownMarket (same shape regardless
+    of BTC/ETH/SOL/XRP).
     """
     market: CryptoUpDownMarket
     # Populated by generate_crypto_tech_signal from its `underlying` arg.
@@ -55,10 +54,12 @@ class TradingSignal:
     reasoning: str = ""
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
-    # BTC price context
-    btc_price: float = 0.0
-    btc_change_1h: float = 0.0
-    btc_change_24h: float = 0.0
+    # Underlying price + momentum-derived 1h/24h change proxies.
+    # Renamed from btc_price/btc_change_* in slice 3e now that this
+    # dataclass represents any crypto, not just BTC.
+    underlying_price: float = 0.0
+    underlying_change_1h: float = 0.0
+    underlying_change_24h: float = 0.0
 
     @property
     def passes_threshold(self) -> bool:
@@ -296,9 +297,17 @@ async def generate_crypto_tech_signal(
         filter_reasons.append(f"entry {entry_price:.0%} > {settings.MAX_ENTRY_PRICE:.0%}")
     filter_note = f" [{', '.join(filter_reasons)}]" if filter_reasons else ""
 
+    # Precision-adaptive price formatting: BTC => "$77,987", SOL => "$85.74",
+    # XRP => "$1.43". Fixes the cosmetic bug flagged in slice 3d where
+    # XRP's $1.43 spot was rendering as "$1" due to a fixed .0f format.
+    if micro.price >= 100:
+        price_str = f"${micro.price:,.0f}"
+    else:
+        price_str = f"${micro.price:,.2f}"
+
     reasoning = (
         f"[{filter_status}]{filter_note} "
-        f"{underlying} ${micro.price:,.0f} | RSI:{micro.rsi:.0f} Mom1m:{micro.momentum_1m:+.3f}% "
+        f"{underlying} {price_str} | RSI:{micro.rsi:.0f} Mom1m:{micro.momentum_1m:+.3f}% "
         f"Mom5m:{micro.momentum_5m:+.3f}% VWAP:{micro.vwap_deviation:+.3f}% "
         f"SMA:{micro.sma_crossover:+.4f}% Vol:{micro.volatility:.4f}% | "
         f"Composite:{composite:+.3f} -> Model UP:{model_up_prob:.0%} vs Mkt:{market_up_prob:.0%} | "
@@ -322,9 +331,9 @@ async def generate_crypto_tech_signal(
         suggested_size=suggested_size,
         sources=[f"binance_microstructure_{micro.source}"],
         reasoning=reasoning,
-        btc_price=micro.price,
-        btc_change_1h=micro.momentum_5m * 12,
-        btc_change_24h=micro.momentum_15m * 96,
+        underlying_price=micro.price,
+        underlying_change_1h=micro.momentum_5m * 12,
+        underlying_change_24h=micro.momentum_15m * 96,
     )
 
 
@@ -398,6 +407,9 @@ def _persist_signals(signals: list):
             db_signal = Signal(
                 market_ticker=signal.market.market_id,
                 platform="polymarket",
+                market_type="btc",                  # calibration bucket (shared across all Polymarket crypto 5-min)
+                underlying_asset=signal.underlying,  # per-asset attribution for analytics
+                asset_class="crypto",
                 timestamp=signal.timestamp,
                 direction=signal.direction,
                 model_probability=signal.model_probability,
@@ -437,7 +449,7 @@ if __name__ == "__main__":
 
         for signal in actionable[:5]:
             print(f"\n{signal.market.slug}")
-            print(f"  Price: ${signal.btc_price:,.0f} ({signal.btc_change_24h:+.2f}%)")
+            print(f"  Price: ${signal.underlying_price:,.2f} ({signal.underlying_change_24h:+.2f}%)")
             print(f"  Model UP: {signal.model_probability:.1%} vs Market UP: {signal.market_probability:.1%}")
             print(f"  Edge: {signal.edge:+.1%} -> {signal.direction.upper()}")
             print(f"  Size: ${signal.suggested_size:.2f}")

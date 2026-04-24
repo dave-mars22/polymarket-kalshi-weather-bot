@@ -108,8 +108,8 @@ class SignalResponse(BaseModel):
     timestamp: datetime
     category: str = "crypto"
     event_slug: Optional[str] = None
-    btc_price: float = 0.0
-    btc_change_24h: float = 0.0
+    underlying_price: float = 0.0
+    underlying_change_24h: float = 0.0
     window_end: Optional[datetime] = None
     actionable: bool = False
 
@@ -340,8 +340,8 @@ def _signal_to_response(s: TradingSignal, actionable: bool = False) -> SignalRes
         timestamp=s.timestamp,
         category="crypto",
         event_slug=s.market.slug,
-        btc_price=s.btc_price,
-        btc_change_24h=s.btc_change_24h,
+        underlying_price=s.underlying_price,
+        underlying_change_24h=s.underlying_change_24h,
         window_end=s.market.window_end,
         actionable=actionable,
     )

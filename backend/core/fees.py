@@ -124,21 +124,21 @@ class PolymarketFeeModel(FeeModel):
 
 def get_fee_model(
     venue: Venue,
-    btc_slippage_bps: int = 10,
+    polymarket_slippage_bps: int = 10,
     kalshi_slippage_bps: int = 50,
     market_type: str = "btc",
 ) -> FeeModel:
     """
     Build the right fee model for (venue, market_type). Slippage defaults
-    differ because BTC 5-min Polymarket books are tighter than Kalshi books.
+    differ because Polymarket crypto books are tighter than Kalshi books.
 
     market_type is recognized explicitly:
-      - "btc":         BTC 5-min binary markets (tight book) -> btc_slippage_bps
-      - "monte_carlo": Kalshi GBM-priced contracts           -> kalshi_slippage_bps
+      - "btc":         Polymarket crypto 5-min markets (tight book) -> polymarket_slippage_bps
+      - "monte_carlo": Kalshi GBM-priced contracts                  -> kalshi_slippage_bps
     Any other value raises to prevent silent mis-routing.
     """
     if market_type == "btc":
-        slippage = btc_slippage_bps
+        slippage = polymarket_slippage_bps
     elif market_type == "monte_carlo":
         slippage = kalshi_slippage_bps
     else:
@@ -160,7 +160,7 @@ def net_edge(
     size_usd: float,
     venue: Venue,
     market_type: str = "btc",
-    btc_slippage_bps: int = 10,
+    polymarket_slippage_bps: int = 10,
     kalshi_slippage_bps: int = 50,
 ) -> tuple[float, float, FeeBreakdown]:
     """
@@ -177,7 +177,7 @@ def net_edge(
 
     fee_model = get_fee_model(
         venue,
-        btc_slippage_bps=btc_slippage_bps,
+        polymarket_slippage_bps=polymarket_slippage_bps,
         kalshi_slippage_bps=kalshi_slippage_bps,
         market_type=market_type,
     )

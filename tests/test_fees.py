@@ -105,7 +105,7 @@ class TestMarketTypeRouting(unittest.TestCase):
     def test_btc_uses_btc_slippage(self):
         model = get_fee_model(
             "polymarket",
-            btc_slippage_bps=10, kalshi_slippage_bps=50,
+            polymarket_slippage_bps=10, kalshi_slippage_bps=50,
             market_type="btc",
         )
         self.assertIsInstance(model, PolymarketFeeModel)
@@ -114,7 +114,7 @@ class TestMarketTypeRouting(unittest.TestCase):
     def test_monte_carlo_uses_kalshi_slippage(self):
         model = get_fee_model(
             "kalshi",
-            btc_slippage_bps=10, kalshi_slippage_bps=50,
+            polymarket_slippage_bps=10, kalshi_slippage_bps=50,
             market_type="monte_carlo",
         )
         self.assertIsInstance(model, KalshiFeeModel)

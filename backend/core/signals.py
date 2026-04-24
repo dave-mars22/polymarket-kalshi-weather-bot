@@ -223,7 +223,7 @@ async def generate_crypto_tech_signal(
         size_usd=trial_size,
         venue="polymarket",
         market_type="btc",
-        btc_slippage_bps=settings.BTC_SLIPPAGE_BPS,
+        polymarket_slippage_bps=settings.POLYMARKET_CRYPTO_SLIPPAGE_BPS,
         kalshi_slippage_bps=settings.KALSHI_SLIPPAGE_BPS,
     )
     fee_cost = fee_breakdown.total

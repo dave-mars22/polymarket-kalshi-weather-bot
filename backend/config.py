@@ -39,7 +39,6 @@ class Settings(BaseSettings):
     # BTC 5-min specific settings
     SCAN_INTERVAL_SECONDS: int = 60  # Scan every minute
     SETTLEMENT_INTERVAL_SECONDS: int = 120  # Check settlements every 2 min
-    BTC_PRICE_SOURCE: str = "coinbase"
     MIN_EDGE_THRESHOLD: float = 0.02  # 2% edge required — these are 50/50 markets
     MAX_ENTRY_PRICE: float = 0.55  # Enter up to 55c
     MAX_TRADES_PER_WINDOW: int = 1
@@ -64,9 +63,11 @@ class Settings(BaseSettings):
     # Volume filter
     MIN_MARKET_VOLUME: float = 100.0  # Low volume for 5-min markets
 
-    # Slippage (basis points) used by fee-aware edge math
-    BTC_SLIPPAGE_BPS: int = 10      # 0.10% slippage per side for BTC/Polymarket
-    KALSHI_SLIPPAGE_BPS: int = 50   # 0.50% slippage per side for Kalshi markets
+    # Slippage (basis points) used by fee-aware edge math.
+    # Applies venue-wide: not BTC-specific — all Polymarket crypto 5-min
+    # trades (BTC/ETH/SOL/XRP) share this slippage assumption.
+    POLYMARKET_CRYPTO_SLIPPAGE_BPS: int = 10   # 0.10% slippage per side
+    KALSHI_SLIPPAGE_BPS: int = 50              # 0.50% slippage per side
 
     # === MONTE CARLO BRAIN ===
     # (full config batch lands when scheduler wires in; these two ship now

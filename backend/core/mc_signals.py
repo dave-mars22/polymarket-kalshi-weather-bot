@@ -332,7 +332,7 @@ def _evaluate_side(
     trial_size = max(1.0, settings.MC_MAX_TRADE_SIZE_PCT * alloc.bankroll)
     fee_model = get_fee_model(
         venue="kalshi",
-        btc_slippage_bps=settings.BTC_SLIPPAGE_BPS,
+        polymarket_slippage_bps=settings.POLYMARKET_CRYPTO_SLIPPAGE_BPS,
         kalshi_slippage_bps=settings.KALSHI_SLIPPAGE_BPS,
         market_type="monte_carlo",
     )

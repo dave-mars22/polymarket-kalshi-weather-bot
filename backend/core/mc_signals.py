@@ -30,9 +30,9 @@ Key design notes:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func
 
@@ -103,6 +103,10 @@ class MonteCarloSignal:
     vol_used: float
     drift_used: float
     years_to_expiry: float
+    # Slice 4: feature snapshot for future ML. Frozen dataclass still allows
+    # mutable default_factory; dict content may be further augmented by
+    # persist_mc_signals / scheduler at execution time via explicit copy.
+    features: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -361,6 +365,36 @@ def _evaluate_side(
         sim_bundle=sim_bundle, size=size, passes=passes,
     )
 
+    # Slice 4: feature snapshot for ML training. Captures full inputs to
+    # the GBM pricing decision so we can regress realized-vs-predicted
+    # edge against e.g. vol regime, time-to-expiry, barrier distance.
+    features: Dict[str, Any] = {
+        "strategy": "monte_carlo",
+        "contract_style": market.contract_style,
+        "underlying": market.underlying_asset,
+        "asset_class": market.asset_class,
+        "spot_used": round(sim_bundle.spot, 6),
+        "vol_used": round(sim_bundle.vol, 6),
+        "drift_used": round(sim_bundle.drift, 6),
+        "years_to_expiry": round(sim_bundle.years_to_expiry, 8),
+        "n_paths": int(settings.MC_NUM_PATHS),
+        "model_probability": round(model_p, 6),
+        "market_probability": round(ask, 6),
+        "raw_edge": round(raw_edge, 6),
+        "net_edge": round(net_edge_val, 6),
+        "fee_cost": round(fee_breakdown.total, 4),
+        "ticker": market.ticker,
+        "threshold": float(market.threshold),
+        "threshold_upper": (
+            float(market.threshold_upper) if market.threshold_upper is not None else None
+        ),
+        "yes_ask": round(market.yes_ask, 6),
+        "yes_bid": round(market.yes_bid, 6),
+        "no_ask": round(market.no_ask, 6),
+        "no_bid": round(market.no_bid, 6),
+        "direction_chosen": side,
+    }
+
     return MonteCarloSignal(
         market=market,
         direction=side,
@@ -376,6 +410,7 @@ def _evaluate_side(
         vol_used=sim_bundle.vol,
         drift_used=sim_bundle.drift,
         years_to_expiry=sim_bundle.years_to_expiry,
+        features=features,
     )
 
 
@@ -530,6 +565,7 @@ def persist_mc_signals(signals: List[MonteCarloSignal]) -> int:
                 sources=[f"gbm_{s.market.contract_style}"],
                 reasoning=reasoning_with_rules,
                 executed=False,
+                features=dict(s.features),  # slice 4: detached copy
             )
             db.add(db_sig)
             written += 1

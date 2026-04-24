@@ -158,6 +158,20 @@ async def scan_and_trade_job():
                 # Map up/down to yes/no for storage
                 entry_price = signal.market.up_price if signal.direction == "up" else signal.market.down_price
 
+                # Slice 4: inherit signal features, layer on execution
+                # context (wall-clock, queue depth, bankroll). Merged in
+                # this order so signal keys win if they ever collide.
+                now_utc = datetime.utcnow()
+                trade_features = {
+                    "exec_hour_utc": now_utc.hour,
+                    "exec_minute": now_utc.minute,
+                    "exec_day_of_week": now_utc.weekday(),
+                    "exec_total_pending": total_pending,
+                    "exec_pending_this_underlying": pending_same_underlying,
+                    "exec_bankroll_at_entry": round(state.bankroll, 2),
+                    **dict(signal.features),
+                }
+
                 trade = Trade(
                     market_ticker=signal.market.market_id,
                     platform="polymarket",
@@ -170,7 +184,8 @@ async def scan_and_trade_job():
                     size=trade_size,
                     model_probability=signal.model_probability,
                     market_price_at_entry=signal.market_probability,
-                    edge_at_entry=signal.edge
+                    edge_at_entry=signal.edge,
+                    features=trade_features,
                 )
 
                 db.add(trade)
@@ -318,6 +333,33 @@ async def mc_scan_and_trade_job():
                     log_event("info", f"[MC] skip {ticker}: size ${size:.2f} below $1 floor")
                     continue
 
+                # Slice 4: inherit signal features, layer on execution
+                # context. For MC, also capture the refreshed ask so we can
+                # later audit how much the quote shifted between scan and
+                # fill. Bankroll here = pilot bankroll (what sizing uses).
+                now_utc = datetime.utcnow()
+                mc_total_pending = db.query(Trade).filter(
+                    Trade.settled == False,  # noqa: E712
+                    Trade.market_type == "monte_carlo",
+                ).count()
+                mc_pending_this_und = db.query(Trade).filter(
+                    Trade.settled == False,  # noqa: E712
+                    Trade.market_type == "monte_carlo",
+                    Trade.underlying_asset == signal.market.underlying_asset,
+                ).count()
+                trade_features = {
+                    "exec_hour_utc": now_utc.hour,
+                    "exec_minute": now_utc.minute,
+                    "exec_day_of_week": now_utc.weekday(),
+                    "exec_total_pending": mc_total_pending,
+                    "exec_pending_this_underlying": mc_pending_this_und,
+                    "exec_bankroll_at_entry": round(
+                        float(settings.MC_PILOT_BANKROLL_USD), 2
+                    ),
+                    "exec_refreshed_ask": round(current_ask, 6),
+                    **dict(signal.features),
+                }
+
                 trade = Trade(
                     market_ticker=ticker,
                     platform=signal.market.venue,
@@ -332,6 +374,7 @@ async def mc_scan_and_trade_job():
                     model_probability=signal.model_probability,
                     market_price_at_entry=current_ask,
                     edge_at_entry=signal.net_edge,
+                    features=trade_features,
                 )
                 db.add(trade)
                 db.flush()

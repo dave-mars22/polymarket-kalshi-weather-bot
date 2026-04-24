@@ -61,6 +61,11 @@ class TradingSignal:
     underlying_change_1h: float = 0.0
     underlying_change_24h: float = 0.0
 
+    # Slice 4: structured feature snapshot for future ML training. Built by
+    # the generator, copied onto the Trade row at execution, merged with
+    # settlement outcome keys at resolution.
+    features: dict = field(default_factory=dict)
+
     @property
     def passes_threshold(self) -> bool:
         """Check if signal passes minimum edge threshold (after fees)."""
@@ -328,6 +333,33 @@ async def generate_crypto_tech_signal(
         f"Window ends: {market.window_end.strftime('%H:%M UTC')}"
     )
 
+    # Slice 4: feature snapshot for future ML. Keep keys stable — downstream
+    # analysis scripts read these via SQLite json_extract. `filter_status`
+    # records whether this signal cleared every gate or was zeroed out.
+    minutes_to_close = max(0.0, time_remaining / 60.0)
+    features: dict = {
+        "strategy": "crypto_tech_5m",
+        "underlying": underlying,
+        "rsi": round(micro.rsi, 4),
+        "momentum_1m": round(micro.momentum_1m, 6),
+        "momentum_5m": round(micro.momentum_5m, 6),
+        "momentum_15m": round(micro.momentum_15m, 6),
+        "vwap_deviation": round(micro.vwap_deviation, 6),
+        "sma_crossover": round(micro.sma_crossover, 6),
+        "volatility": round(micro.volatility, 6),
+        "composite_score": round(composite, 6),
+        "model_prob_raw": round(0.50 + composite * 0.15, 6),
+        "model_prob_clipped": round(model_up_prob, 6),
+        "underlying_price": round(micro.price, 4),
+        "market_volume_24h": round(market.volume_24h, 2),
+        "up_price": round(market.up_price, 4),
+        "down_price": round(market.down_price, 4),
+        "spread": round(market.spread, 4),
+        "minutes_to_close": round(minutes_to_close, 2),
+        "convergence_score": max(up_votes, down_votes),
+        "filter_status": filter_status,
+    }
+
     return TradingSignal(
         market=market,
         underlying=underlying,
@@ -346,6 +378,7 @@ async def generate_crypto_tech_signal(
         underlying_price=micro.price,
         underlying_change_1h=micro.momentum_5m * 12,
         underlying_change_24h=micro.momentum_15m * 96,
+        features=features,
     )
 
 
@@ -433,6 +466,7 @@ def _persist_signals(signals: list):
                 sources=signal.sources,
                 reasoning=signal.reasoning,
                 executed=False,
+                features=dict(signal.features),  # slice 4: detached copy
             )
             db.add(db_signal)
 

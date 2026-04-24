@@ -120,6 +120,47 @@ def _parse_market_resolution(market: dict) -> Tuple[bool, Optional[float]]:
         return False, None
 
 
+def _merge_settlement_features(trade: Trade, settlement_value: float) -> None:
+    """Layer realized-outcome keys onto trade.features without overwriting
+    signal/exec keys already captured at entry time.
+
+    Records: settled_outcome (1/0), realized_pnl, settlement_timestamp,
+    minutes_to_settlement, predicted_vs_realized (model_prob minus actual).
+    """
+    existing = dict(trade.features or {})
+    now = datetime.utcnow()
+    entry_ts = trade.timestamp
+    minutes_to_settle: Optional[float] = None
+    if entry_ts is not None:
+        minutes_to_settle = round((now - entry_ts).total_seconds() / 60.0, 2)
+
+    direction = (trade.direction or "").lower()
+    if direction in ("up", "yes"):
+        predicted_yes_p = trade.model_probability
+    elif direction in ("down", "no"):
+        predicted_yes_p = (
+            1.0 - trade.model_probability
+            if trade.model_probability is not None else None
+        )
+    else:
+        predicted_yes_p = trade.model_probability
+
+    predicted_vs_realized = None
+    if predicted_yes_p is not None:
+        predicted_vs_realized = round(predicted_yes_p - float(settlement_value), 6)
+
+    outcome_patch = {
+        "settled_outcome": float(settlement_value),
+        "realized_pnl": None if trade.pnl is None else round(float(trade.pnl), 4),
+        "settlement_timestamp": now.isoformat(),
+        "minutes_to_settlement": minutes_to_settle,
+        "predicted_vs_realized": predicted_vs_realized,
+    }
+    # Merge so existing signal/exec keys win on any (unexpected) collision;
+    # outcome keys use distinct names so in practice both sets coexist.
+    trade.features = {**outcome_patch, **existing}
+
+
 def calculate_pnl(trade: Trade, settlement_value: float) -> float:
     """
     Calculate P&L for a trade given the settlement value.
@@ -246,6 +287,13 @@ async def settle_pending_trades(db: Session) -> List[Trade]:
                     trade.result = "loss"
                 else:
                     trade.result = "push"
+
+                # Slice 4: merge realized outcome keys into trade.features.
+                # Merge (not overwrite) so signal/exec features survive.
+                # predicted_vs_realized = model_probability vs actual outcome
+                # bit (1.0/0.0), expressed as signed error. Minutes to
+                # settlement measured from entry to settlement_time.
+                _merge_settlement_features(trade, settlement_value)
 
                 settled_trades.append(trade)
 

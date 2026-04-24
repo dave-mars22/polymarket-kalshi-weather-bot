@@ -49,6 +49,12 @@ class Trade(Base):
     market_price_at_entry = Column(Float)
     edge_at_entry = Column(Float)
 
+    # Structured feature capture for future ML training (slice 4). Inherits
+    # the signal's features at trade time, then settlement merges realized-
+    # outcome keys on top. Always a dict — never NULL — so downstream
+    # json_extract queries don't have to handle the absent-row case.
+    features = Column(JSON, default=dict, nullable=False)
+
 
 class BtcPriceSnapshot(Base):
     """Cached BTC prices for momentum calculation."""
@@ -105,6 +111,10 @@ class Signal(Base):
     outcome_correct = Column(Boolean, nullable=True)   # did our direction prediction match?
     settlement_value = Column(Float, nullable=True)     # 1.0=UP won, 0.0=DOWN won
     settled_at = Column(DateTime, nullable=True)        # when we recorded the outcome
+
+    # Structured feature capture for future ML training (slice 4). Populated
+    # at signal creation by each brain. Always a dict — never NULL.
+    features = Column(JSON, default=dict, nullable=False)
 
 
 class AILog(Base):
@@ -185,6 +195,10 @@ def ensure_schema():
         ("underlying_asset", "VARCHAR"),
         ("asset_class", "VARCHAR"),
         ("contract_style", "VARCHAR"),
+        # Slice 4: structured feature persistence. DEFAULT '{}' so existing
+        # rows satisfy NOT NULL with an empty dict rather than getting
+        # backfilled feature values (intentional — see slice 4 spec).
+        ("features", "TEXT NOT NULL DEFAULT '{}'"),
     ]:
         if col not in columns:
             with engine.connect() as conn:
@@ -211,6 +225,8 @@ def ensure_schema():
                 ("underlying_asset", "VARCHAR"),
                 ("asset_class", "VARCHAR"),
                 ("contract_style", "VARCHAR"),
+                # Slice 4: empty dict default for existing signal rows.
+                ("features", "TEXT NOT NULL DEFAULT '{}'"),
             ]:
                 if col not in signal_columns:
                     try:

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 Venue = Literal["kalshi", "polymarket"]
+MarketType = Literal["btc", "monte_carlo"]
 
 
 @dataclass
@@ -128,15 +129,28 @@ def get_fee_model(
     market_type: str = "btc",
 ) -> FeeModel:
     """
-    Build the right fee model. BTC 5-min markets have tighter books than
-    Kalshi markets, so slippage defaults differ.
+    Build the right fee model for (venue, market_type). Slippage defaults
+    differ because BTC 5-min Polymarket books are tighter than Kalshi books.
+
+    market_type is recognized explicitly:
+      - "btc":         BTC 5-min binary markets (tight book) -> btc_slippage_bps
+      - "monte_carlo": Kalshi GBM-priced contracts           -> kalshi_slippage_bps
+    Any other value raises to prevent silent mis-routing.
     """
-    slippage = btc_slippage_bps if market_type == "btc" else kalshi_slippage_bps
+    if market_type == "btc":
+        slippage = btc_slippage_bps
+    elif market_type == "monte_carlo":
+        slippage = kalshi_slippage_bps
+    else:
+        raise ValueError(
+            f"Unknown market_type: {market_type!r} (expected 'btc' or 'monte_carlo')"
+        )
+
     if venue == "kalshi":
         return KalshiFeeModel(slippage_bps=slippage)
     if venue == "polymarket":
         return PolymarketFeeModel(slippage_bps=slippage)
-    raise ValueError(f"Unknown venue: {venue}")
+    raise ValueError(f"Unknown venue: {venue!r}")
 
 
 def net_edge(
@@ -173,10 +187,14 @@ def net_edge(
     # If a trade risks $size_usd and costs $X in fees, that's X/size_usd of edge lost.
     fee_as_edge = costs.total / size_usd if size_usd > 0 else 0.0
 
-    net = raw - fee_as_edge if raw > 0 else raw + fee_as_edge
-    # Above: if you're betting YES (raw > 0), fees reduce edge.
-    # If you're betting NO (raw < 0), you flip the sign of raw for sizing,
-    # so fees still make it worse — treat symmetrically.
+    # Fees always reduce the UP-side post-fee edge. Sign-preserving: if
+    # the caller's view is bearish (raw < 0), net is more negative.
+    # Callers who pick a direction separately (e.g. BTC signals.py) should
+    # compute their direction-specific post-fee edge from (raw_edge_val,
+    # fee_breakdown.total / size_usd) rather than reinterpret this value's
+    # sign. A prior version had a sign-flip branch for raw<=0; it produced
+    # wrong magnitudes (with the wrong sign) when fees exceeded |raw|.
+    net = raw - fee_as_edge
 
     return raw, net, costs
     

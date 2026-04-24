@@ -230,7 +230,14 @@ async def generate_btc_signal(market: BtcMarket) -> Optional[TradingSignal]:
         and time_ok
     )
 
-    edge = abs(net_edge_val) if raw_edge_val >= 0 else -abs(net_edge_val)
+    # calculate_edge returns the direction-specific positive raw edge;
+    # fees reduce it. If fees exceed raw edge, no profitable direction
+    # exists — zero out to skip. (Earlier version used a sign-flip trick
+    # on net_edge_val which broke when fees > |raw|; we now derive
+    # direction-specific edge from fee_breakdown directly.)
+    fee_as_edge = fee_breakdown.total / trial_size if trial_size > 0 else 0.0
+    edge = max(0.0, raw_edge_val - fee_as_edge)
+    net_edge_val = edge
 
     if not passes_filters:
         edge = 0.0

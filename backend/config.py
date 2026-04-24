@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     # because the data layer reads them directly)
     MC_HISTORICAL_CACHE_SECONDS: int = 3600   # 1 h — vol barely moves intraday
     MC_SPOT_CACHE_SECONDS: int = 30           # 30 s — fresh enough for daily markets
+    MC_MAX_TIME_TO_EXPIRY_DAYS: float = 30.0  # skip contracts expiring beyond 30 days
 
     class Config:
         env_file = ".env"

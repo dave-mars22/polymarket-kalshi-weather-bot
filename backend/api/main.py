@@ -7,15 +7,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Dict, List, Optional
 import asyncio
 import json
+import logging
 import os
 import re
+
+logger = logging.getLogger("trading_bot")
 
 from backend.config import settings
 from backend.models.database import (
     get_db, init_db, SessionLocal,
     Signal, Trade, BotState, ScanLog
 )
-from backend.core.signals import scan_for_signals, TradingSignal
+from backend.core.signals import scan_for_signals, get_cached_scan, TradingSignal
 from backend.data.crypto_markets import fetch_active_crypto_markets, CryptoUpDownMarket
 from backend.data.crypto import fetch_crypto_price, compute_crypto_microstructure
 
@@ -1229,10 +1232,37 @@ async def get_dashboard(db: Session = Depends(get_db)):
     except Exception:
         pass
 
-    # Signals — return ALL signals, mark which are actionable
+    # Signals — return ALL signals, mark which are actionable.
+    #
+    # Slice P2: serve from the in-process cache populated by the
+    # scheduler every 60s instead of running our own scan per request.
+    # Pre-P2 this block called scan_for_signals() directly and added
+    # ~4s of latency to every /api/dashboard request (audit finding #2).
+    # Cache-miss path: if the scheduler hasn't fired yet (e.g., the bot
+    # was just restarted), fall back to one live scan so the dashboard
+    # has something useful to show. The fallback does NOT update the
+    # cache itself — only the scheduler is the writer. By the next poll
+    # the scheduler should have populated the cache.
     signals = []
     try:
-        raw_signals = await scan_for_signals()
+        raw_signals, scan_ts = get_cached_scan()
+        if raw_signals is None:
+            import time as _time
+            _t0 = _time.perf_counter()
+            logger.info("[dashboard] scan cache miss — running live fallback scan")
+            raw_signals = await scan_for_signals()
+            logger.info(
+                "[dashboard] cache-miss fallback scan took %.2fs",
+                _time.perf_counter() - _t0,
+            )
+        elif scan_ts is not None:
+            from datetime import datetime as _dt, timezone as _tz
+            age = (_dt.now(_tz.utc) - scan_ts).total_seconds()
+            # Cache age is logged only when >90s (i.e., scheduler missed
+            # at least one cycle) to avoid spamming during the normal 60s
+            # cadence. Observable in logs without changing API shape.
+            if age > 90:
+                logger.warning("[dashboard] serving stale scan cache (%.0fs old)", age)
         signals = [_signal_to_response(s, actionable=s.passes_threshold) for s in raw_signals]
     except Exception:
         pass

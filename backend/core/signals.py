@@ -6,8 +6,8 @@ actual iteration over multiple underlyings lands in slice 3e. Until then,
 scan_for_signals() scans BTC only (behavior-identical to pre-3a-2).
 """
 import logging
-from datetime import datetime
-from typing import Optional, List
+from datetime import datetime, timezone
+from typing import Optional, List, Tuple
 from dataclasses import dataclass, field
 import asyncio
 
@@ -19,6 +19,50 @@ from backend.data.crypto import fetch_crypto_price, compute_crypto_microstructur
 from backend.models.database import SessionLocal, Signal
 
 logger = logging.getLogger("trading_bot")
+
+
+# ---------------------------------------------------------------------
+# Slice P2: in-process cache for the latest scan_for_signals() result.
+#
+# Pre-P2, /api/dashboard called scan_for_signals() on every request,
+# duplicating the work the scheduler does every 60s and adding ~4s of
+# latency to each dashboard poll (per AUDIT_2026-04-25 finding #2). The
+# scheduler is the single source of fresh signals; the dashboard just
+# needs to *read* whatever the scheduler last produced.
+#
+# Concurrency model: single-writer (scheduler.scan_and_trade_job calls
+# update_cached_scan once per cycle), multi-reader (any FastAPI request
+# can call get_cached_scan). We rely on CPython's GIL: a single name
+# binding (`_scan_cache = (signals, ts)`) is atomic, so a reader sees
+# either the previous tuple or the new tuple — never partial state.
+# Storing signals + timestamp together as a single tuple is what makes
+# the read atomic; if they were two separate variables a reader could
+# observe new signals with an old timestamp (cosmetic but worth doing
+# right). No threading.Lock or asyncio.Lock needed for this pattern.
+# ---------------------------------------------------------------------
+_scan_cache: Optional[Tuple[List["TradingSignal"], datetime]] = None
+
+
+def get_cached_scan() -> Tuple[Optional[List["TradingSignal"]], Optional[datetime]]:
+    """Return the latest cached (signals, timestamp) tuple, or
+    (None, None) if no scan has populated the cache yet (e.g., bot
+    just started and scheduler hasn't fired its first scan)."""
+    snapshot = _scan_cache  # atomic single-name read
+    if snapshot is None:
+        return (None, None)
+    return snapshot
+
+
+def update_cached_scan(signals: List["TradingSignal"]) -> None:
+    """Replace the cache with a new scan result tagged with the current
+    UTC time. Single-writer pattern — only call from
+    scheduler.scan_and_trade_job. Atomic single-name binding under GIL
+    means readers see either the old tuple or the new tuple, never partial.
+
+    A defensive copy of `signals` is stored so future callers cannot
+    mutate the cached list and affect later reads."""
+    global _scan_cache
+    _scan_cache = (list(signals), datetime.now(timezone.utc))
 
 
 @dataclass

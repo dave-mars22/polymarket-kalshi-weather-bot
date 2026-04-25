@@ -9,7 +9,7 @@ import logging
 
 from backend.config import settings
 from backend.models.database import BotState, SessionLocal, Signal, Trade
-from backend.core.signals import scan_for_signals
+from backend.core.signals import scan_for_signals, update_cached_scan
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("trading_bot")
@@ -70,6 +70,10 @@ async def scan_and_trade_job():
 
     try:
         signals = await scan_for_signals()
+        # Slice P2: publish to the in-process cache so /api/dashboard
+        # can serve from this list instead of running its own ~4s scan.
+        # Single-writer pattern; see signals.py docstring.
+        update_cached_scan(signals)
         actionable = [s for s in signals if s.passes_threshold]
 
         log_event("data", f"Found {len(signals)} signals, {len(actionable)} actionable", {

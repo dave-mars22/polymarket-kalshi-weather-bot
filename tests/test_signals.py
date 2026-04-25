@@ -317,5 +317,95 @@ class TestScanForSignalsParallelism(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+class TestScanCache(unittest.TestCase):
+    """Slice P2: pin the cache helpers' contract so /api/dashboard can
+    rely on them. Tests run in module-load order; reset the cache before
+    each so the never-populated test isn't polluted by a prior write."""
+
+    def setUp(self):
+        # Reset module-level cache between tests to keep them independent.
+        import backend.core.signals as signals_mod
+        signals_mod._scan_cache = None
+
+    def _make_signal(self, market_id: str, edge: float):
+        """Build a minimal TradingSignal (only the fields the cache cares
+        about — equality is by identity through the list). Uses the real
+        dataclass so we don't drift from the production schema."""
+        from backend.core.signals import TradingSignal
+        from backend.data.crypto_markets import CryptoUpDownMarket
+        now = datetime.now(timezone.utc)
+        market = CryptoUpDownMarket(
+            slug=f"btc-updown-5m-{market_id}",
+            market_id=market_id,
+            up_price=0.5, down_price=0.5,
+            window_start=now, window_end=now,
+            volume=0.0, volume_24h=100.0, closed=False,
+        )
+        return TradingSignal(
+            market=market, underlying="BTC", edge=edge, raw_edge=edge,
+            net_edge=edge, model_probability=0.55, market_probability=0.50,
+        )
+
+    def test_empty_cache_returns_none_none(self):
+        from backend.core.signals import get_cached_scan
+        sigs, ts = get_cached_scan()
+        self.assertIsNone(sigs)
+        self.assertIsNone(ts)
+
+    def test_round_trip_preserves_signals_and_attaches_timestamp(self):
+        from backend.core.signals import update_cached_scan, get_cached_scan
+        s1 = self._make_signal("m1", 0.07)
+        s2 = self._make_signal("m2", 0.05)
+        before = datetime.now(timezone.utc)
+        update_cached_scan([s1, s2])
+        after = datetime.now(timezone.utc)
+        cached, ts = get_cached_scan()
+        self.assertEqual(len(cached), 2)
+        # Order preserved (cache makes a copy but doesn't reorder).
+        self.assertIs(cached[0], s1)
+        self.assertIs(cached[1], s2)
+        # Timestamp falls in [before, after] — assigned during update.
+        self.assertIsNotNone(ts)
+        self.assertGreaterEqual(ts, before)
+        self.assertLessEqual(ts, after)
+
+    def test_second_update_replaces_first(self):
+        from backend.core.signals import update_cached_scan, get_cached_scan
+        update_cached_scan([self._make_signal("first", 0.06)])
+        cached1, _ = get_cached_scan()
+        update_cached_scan([self._make_signal("second", 0.08)])
+        cached2, _ = get_cached_scan()
+        self.assertEqual(len(cached1), 1)
+        self.assertEqual(len(cached2), 1)
+        self.assertEqual(cached1[0].market.market_id, "first")
+        self.assertEqual(cached2[0].market.market_id, "second")
+
+    def test_defensive_copy_isolates_caller_mutations(self):
+        """Mutating the list returned by get_cached_scan must not affect
+        what subsequent callers see. update_cached_scan stores a list()
+        copy of the input; reads return that stored list, so any caller
+        mutation is on our copy. Pin the property here in case anyone
+        ever inlines update_cached_scan and forgets the list() wrap."""
+        from backend.core.signals import update_cached_scan, get_cached_scan
+        original = [self._make_signal("a", 0.07), self._make_signal("b", 0.06)]
+        update_cached_scan(original)
+        cached1, _ = get_cached_scan()
+        # Mutating the *input* after update should not leak into cache.
+        original.append(self._make_signal("LEAK", 0.99))
+        cached2, _ = get_cached_scan()
+        self.assertEqual(len(cached2), 2)  # would be 3 if input wasn't copied
+        self.assertNotIn("LEAK", [s.market.market_id for s in cached2])
+
+    def test_empty_list_is_a_valid_cache_value(self):
+        """update_cached_scan([]) means 'scan ran and found nothing' —
+        that is a meaningful state, distinct from never-populated. The
+        dashboard relies on this distinction for its cache-miss fallback."""
+        from backend.core.signals import update_cached_scan, get_cached_scan
+        update_cached_scan([])
+        cached, ts = get_cached_scan()
+        self.assertEqual(cached, [])
+        self.assertIsNotNone(ts, "timestamp must still be set even when signals=[]")
+
+
 if __name__ == "__main__":
     unittest.main()

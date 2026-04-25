@@ -467,6 +467,102 @@ class TestApiExpansion(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)), "no duplicate trade ids")
 
 
+class TestDashboardServesScanCache(unittest.TestCase):
+    """Slice P2: /api/dashboard must read from the scan cache populated
+    by the scheduler, NOT call scan_for_signals on every request. These
+    tests pin both: cache-hit reads the stored signals, and the live
+    scan path is NOT called when the cache is fresh."""
+
+    def setUp(self):
+        self.client, self.SessionLocal, self._reset = _build_test_app_with_db()
+        _seed_bot_state(self.SessionLocal)
+        # Reset the cache so each test starts from a known state.
+        import backend.core.signals as signals_mod
+        signals_mod._scan_cache = None
+
+    def tearDown(self):
+        self._reset()
+        import backend.core.signals as signals_mod
+        signals_mod._scan_cache = None
+
+    def _make_cached_signal(self, market_id: str, edge: float):
+        """Build a TradingSignal with a distinctive market_id we can
+        assert on in the response."""
+        from backend.core.signals import TradingSignal
+        from backend.data.crypto_markets import CryptoUpDownMarket
+        now = datetime.utcnow()
+        market = CryptoUpDownMarket(
+            slug=f"btc-updown-5m-{market_id}",
+            market_id=market_id,
+            up_price=0.5, down_price=0.5,
+            window_start=now, window_end=now,
+            volume=100.0, volume_24h=500.0, closed=False,
+        )
+        return TradingSignal(
+            market=market, underlying="BTC",
+            edge=edge, raw_edge=edge, net_edge=edge,
+            model_probability=0.55, market_probability=0.50,
+            direction="up",
+        )
+
+    @patch("backend.api.main.compute_crypto_microstructure",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.fetch_crypto_price",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.fetch_active_crypto_markets",
+           new=AsyncMock(return_value=[]))
+    @patch("backend.api.main.scan_for_signals",
+           new_callable=AsyncMock)
+    def test_dashboard_serves_cached_signals_without_calling_scan(
+        self, mock_scan, *_other_mocks,
+    ):
+        """When the cache is populated, /api/dashboard must NOT call
+        scan_for_signals. The cached signal's distinctive ticker must
+        appear in the response.active_signals payload."""
+        from backend.core.signals import update_cached_scan
+        cached = [
+            self._make_cached_signal("CACHED-PROOF-A", 0.07),
+            self._make_cached_signal("CACHED-PROOF-B", 0.06),
+        ]
+        update_cached_scan(cached)
+
+        r = self.client.get("/api/dashboard")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        tickers = [s["market_ticker"] for s in body["active_signals"]]
+        self.assertEqual(
+            sorted(tickers),
+            ["CACHED-PROOF-A", "CACHED-PROOF-B"],
+            "dashboard must serve the cached signals, not a live scan result",
+        )
+        # The load-bearing assertion: scan_for_signals was NEVER called
+        # during the dashboard request when cache was populated.
+        mock_scan.assert_not_called()
+
+    @patch("backend.api.main.compute_crypto_microstructure",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.fetch_crypto_price",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.fetch_active_crypto_markets",
+           new=AsyncMock(return_value=[]))
+    @patch("backend.api.main.scan_for_signals",
+           new_callable=AsyncMock)
+    def test_dashboard_falls_back_to_live_scan_on_cache_miss(
+        self, mock_scan, *_other_mocks,
+    ):
+        """When the cache has never been populated (e.g., bot just
+        restarted, scheduler hasn't fired), /api/dashboard must fall
+        back to one live scan_for_signals call so the user has
+        something to look at."""
+        # Cache is None per setUp.
+        mock_scan.return_value = []  # live fallback returns empty
+        r = self.client.get("/api/dashboard")
+        self.assertEqual(r.status_code, 200)
+        # The fallback path was taken — scan_for_signals called exactly
+        # once (the dashboard endpoint, not the scheduler).
+        self.assertEqual(mock_scan.call_count, 1)
+
+
 class TestKalshiSettlementParser(unittest.TestCase):
     def test_parses_yymmmdd_from_ticker(self):
         from backend.api.main import _parse_kalshi_expected_settlement

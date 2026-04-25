@@ -1,8 +1,8 @@
 # RESEARCH_NOTES.md
 
-*Project research memory. Companion to README.md (what the code does) and ARCHITECTURE.md (historical, pre-rebuild). This document captures what we have **learned**, what we have **decided**, and what we plan to **investigate**. It is updated as the project evolves — every diagnostic, parameter change, and checkpoint adds to it.*
+*Project research memory. Companion to README.md (what the code does), ARCHITECTURE.md (historical, pre-rebuild), and STRATEGY3_SCOPE.md (cross-platform arbitrage scoping doc). This document captures what we have **learned**, what we have **decided**, and what we plan to **investigate**. It is updated as the project evolves — every diagnostic, parameter change, and checkpoint adds to it.*
 
-*Last meaningful update: 2026-04-25 (initial creation).*
+*Last meaningful update: 2026-04-25 (slice N4 — first MC settlements + audit blind spot + reflect P1/P2/B1/N3).*
 
 ---
 
@@ -21,12 +21,18 @@ A simulated multi-strategy trading bot operating on Polymarket and Kalshi predic
 
 ## 2. Current Strategy State
 
-*Last updated: 2026-04-25 (post-S2).*
+*Last updated: 2026-04-25 (post-B1; first MC settlements landed today).*
 
-Two strategies running simultaneously:
+Two strategies running simultaneously, plus a third under scoping:
 
 - **Technical brain**: scans 4 underlyings (BTC/ETH/SOL/XRP) on Polymarket 5-min markets every 60 s. Generates probability estimates from RSI / momentum (1m, 5m, 15m) / VWAP deviation / SMA crossover composite. Trades when `|edge| ≥ 5%`. ~133 trades/day.
-- **MC barrier brain**: scans 8 Kalshi crypto series (5 BTC + 3 altcoin) every 600 s. Prices barrier options via closed-form GBM with EWMA vol estimation. Trades when `net_edge ≥ 5%` AND quote hasn't drifted between scan and fill. ~4 trades/day post-S2.
+- **MC barrier brain**: scans 8 Kalshi crypto series (5 BTC + 3 altcoin) every 600 s. Prices barrier options via closed-form GBM with EWMA vol estimation. Trades when `net_edge ≥ 5%` AND quote hasn't drifted between scan and fill. ~4 trades/day post-S2. **First settlements landed 2026-04-25** (3 KXBTCD daily contracts, all losses; see Section 3i) — prior to slice B1, every MC trade had been silently stuck in pending state because of an unreachable settlement code path (see Section 3j).
+- **Cross-platform arbitrage (Strategy 3)** — scoped only, not implemented. Hypothesis: persistent spreads between Polymarket BTC binaries and Kalshi KXBTCD barriers can be harvested. Build sequence and evaluation criteria are in `STRATEGY3_SCOPE.md` (top-level artifact alongside this file).
+
+### Infrastructure state (as of 2026-04-25)
+
+- `/api/dashboard` latency: ~2.0 s (was 9.7 s pre-P1, 4.0 s post-P1). Slice P1 parallelized the per-underlying scan loop via `asyncio.gather` (~58% reduction); slice P2 added scan-result caching keyed on `(underlying, scan_cycle_id)` so dashboard reads no longer re-run `scan_for_signals` (additional ~50% reduction). Both changes are correctness-neutral — they only affect latency.
+- MC settlement loop: now actually runs end-to-end. Slice B1 replaced the credential-gated KalshiClient call in `_fetch_kalshi_resolution` with a direct httpx GET against the public Kalshi market endpoint. The credential gate had been bailing on every call since the MC brain shipped, leaving every MC trade pending forever.
 
 ### Critical config values currently in production
 
@@ -131,11 +137,48 @@ All findings are in-sample. Patterns discovered in this data must be validated o
 - **3 BTC series scanned but never traded**: KXBTCMAXD, KXBTCMINMON, KXBTCY. Investigate.
 - MC concentration cap was **the binding constraint**: 170 cap-blocks in 6.7 hours of pre-S2 logs. Addressed by slice S2.
 
+### 3i. First MC settlements (n=3, 2026-04-25)
+
+The first three MC trades to actually settle in the bot DB. All three are KXBTCD-26APR2517 daily-cadence Kalshi BTC barrier contracts that resolved at 17:00 EDT (21:00 UTC). They sat in pending state for hours after Kalshi's resolution because of the B1 bug; they settled within ~2 min of the post-B1 bot restart.
+
+| trade | ticker | dir | size | entry | model_p | settlement_value | result | pnl |
+|---:|---|---|---:|---:|---:|---:|---|---:|
+| 708 | `KXBTCD-26APR2517-T78749.99` | yes | $13.02 | 0.140 | 0.292 | 0.0 | loss | −$1.82 |
+| 709 | `KXBTCD-26APR2517-T77249.99` | no  | $12.46 | 0.280 | 0.400 | 1.0 | loss | −$3.49 |
+| 728 | `KXBTCD-26APR2517-T78499.99` | yes | $14.37 | 0.100 | 0.285 | 0.0 | loss | −$1.44 |
+
+**Total realized: −$6.75. Bot was 0-for-3 on direction.**
+
+Per-trade interpretation:
+
+- Trades 708 and 728 were low-probability long-yes bets (model_p ≈ 0.28–0.29). The model thought YES had ~28% probability and was being underpriced at 10–14¢. The losing outcome is the *modal* outcome the model itself predicted (~71% likely). These losses are individually consistent with the model.
+- Trade 709 was a higher-conviction short-yes (long-no) bet. Model thought NO had ~60% probability; market priced NO at 28¢ — implying ~32 pp edge. The losing outcome is the model's *minority-case* prediction (~40% likely). Still individually consistent with the model, but the one that "should have" been more likely to win.
+
+**Caveats — what this n=3 result does NOT tell us:**
+
+- Wilson 95% CI on 0/3 is roughly **[0%, 71%]**. This data does not distinguish "working model that lost three coin flips" from "broken model".
+- The April 30 KXBTCMAXMON settlements remain the formal first evaluation point per Section 6. Daily KXBTCD settlements between now and then will accumulate sample size; expect roughly 5–10 more daily-cadence settlements over the next 5 days at current open-position rate (n=8–13 daily-cohort points by month-end).
+- **Pricer-accuracy cross-check (TODO):** Kalshi's `expiration_value` for KXBTCD-26APR2517 was **$77,494.41** (BRTI). The MC pricer uses Coinbase BTC-USD as its underlying source. Before drawing any conclusion about pricer accuracy from these settlements, verify that the bot's underlying price snapshot at 17:00 EDT today matches Kalshi's BRTI close to within a reasonable tolerance. A material divergence would mean the pricer was solving the right model on the wrong inputs.
+
+### 3j. Audit blind spot — unreachable code paths (2026-04-25)
+
+The B1 bug surfaced a methodological gap in the comprehensive April 25 audit (`AUDIT_2026-04-25.md`, 30 findings). The audit cataloged what the code **does** but did not flag that `_fetch_kalshi_resolution` returned `(False, None)` without ever making an API call due to an incorrect `kalshi_credentials_present()` gate. Every MC trade had been silently stuck in pending state from the moment the MC brain shipped — a complete strategy-level failure that the audit missed because the code at the gate looked plausible in isolation.
+
+**Generalization:** audit-style code reviews are good at finding what's *there* (style issues, race conditions in code that runs, dead branches in code that runs sometimes) and less good at finding code paths that **never execute** in production. A function that always early-returns on a precondition isn't "broken" by any local code-quality measure — it's only broken in the context of "the strategy depends on this returning real data."
+
+**Mitigations for future audits:**
+
+- Add an explicit "trace every code path from scheduler entry to external API call" check. For each scheduled job, confirm: (a) the function actually runs, (b) it makes the network calls it implies it does, (c) it processes results downstream rather than silently bailing.
+- Consider integration tests that verify settlement (and other end-to-end flows) against real or recorded external responses. Unit tests with mocks pass even when the live code path can never reach the mocked function.
+- Future audits should be reviewed for similar unreachable-path risks **before** their findings list is treated as authoritative. A 30-finding audit that misses a single complete-strategy-failure is worse than no audit if its comprehensiveness creates false confidence.
+
+This finding is methodologically important enough to flag here (rather than just in commit history) so future audits inherit the lesson.
+
 ---
 
-## 4. Parameter Changes (slice log)
+## 4. Code Change Log (slice log)
 
-*Each entry: what changed, runtime impact, rationale, evaluation/revert criteria.*
+*Each entry: what changed, runtime impact, rationale, evaluation/revert criteria. Renamed from "Parameter Changes" in slice N4 — the section now covers parameter tuning (S-prefix), infrastructure/perf changes (P-prefix), and bug fixes (B-prefix), all of which materially change runtime behavior or correctness and deserve the same treatment.*
 
 ### Slice S1 — `MIN_EDGE_THRESHOLD` synced to 0.05 (committed 2026-04-25, hash `b7f0ea8`)
 
@@ -153,23 +196,64 @@ All findings are in-sample. Patterns discovered in this data must be validated o
 - **Risk acknowledgement:** loosens MC pre-validation exposure during a period when **zero MC trades have settled yet**.
 - **Revert criterion:** if April 30 KXBTCMAXMON settlements go badly, OR if interim daily settlements show realized win rate < 40%.
 
+### Slice P1 — Parallelize per-underlying scan loop (committed 2026-04-25, hash `3ddbd82`)
+
+- **What changed:** the technical-brain scan loop in `scan_for_signals` was rewritten to fan out per-underlying scans via `asyncio.gather` instead of running them sequentially. No behavior change — same scans, same ordering of results, same trade decisions. Pure latency optimization.
+- **Runtime behavior:** `/api/dashboard` end-to-end latency dropped from ~9.7 s to ~4.0 s (~58% reduction). Eliminates the scheduler-overlap window that previously caused 60 s scan ticks to occasionally bunch up.
+- **Rationale:** Audit Finding #1 (HIGH severity). Sequential scans were creating timing pressure on the 60 s scheduler. Latency was approaching the cycle interval.
+- **Revert criterion:** none — correctness-neutral perf change. Would only revert if `asyncio.gather` exposed a previously-hidden race condition (none observed).
+
+### Slice P2 — Cache scan results in dashboard endpoint (committed 2026-04-25, hash `dc0861f`)
+
+- **What changed:** `/api/dashboard` previously re-ran `scan_for_signals` on every request to populate the live-signals tile. Slice P2 introduced a single-writer/multi-reader cache keyed on `(underlying, scan_cycle_id)` so the dashboard reuses the most recent scheduler-produced scan instead of re-computing.
+- **Runtime behavior:** dashboard latency dropped from ~4.0 s (post-P1) to ~2.0 s (~50% additional reduction). No staleness concerns: cache is invalidated on every scheduler tick (60 s).
+- **Rationale:** Audit Finding #2 (HIGH severity). Re-running the scan inside an HTTP handler was the second-largest dashboard latency contributor after sequential scanning.
+- **Revert criterion:** none — correctness-neutral. Atomic single-name binding under CPython GIL is safe for single-writer/multi-reader.
+
+### Slice B1 — Fix Kalshi settlement to use public market endpoint (committed 2026-04-25, hash `da6ce41`)
+
+- **What changed:** `_fetch_kalshi_resolution` in `backend/core/settlement.py` previously called `kalshi_credentials_present()` and returned `(False, None)` if creds were missing. Replaced with a direct `httpx.AsyncClient` GET against `https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}` (no auth required for reads). Added optional `http_client` injection seam matching the pattern in `mc_execution.fetch_current_ask`.
+- **Runtime behavior:** MC settlement loop now actually runs end-to-end. First post-restart settlement_job (22:15 UTC, ~2 min after restart) settled all 3 KXBTCD-26APR2517 trades — see Section 3i. Prior to B1: zero MC trades had ever settled in the bot DB.
+- **Rationale:** post-settlement analysis on the 3 KXBTCD-26APR2517 contracts (which Kalshi resolved at 17:00 EDT) found them still pending in the bot DB hours later. Tracing the loop pinpointed the credential gate as the silent failure point. The Kalshi public market endpoint requires no auth — the gate was unnecessary.
+- **Tests:** 10 new unit tests in `tests/test_settlement.py` (first test_settlement.py in the project; audit T2 noted the gap). Covers happy paths, not-yet-resolved paths, error paths, defensive shape handling. Test count 197 → 207.
+- **Revert criterion:** none — pure correctness fix. The code was non-functional before; it's functional now.
+- **B is the bug-fix prefix.** Established here, distinct from S (strategy), T (tools), C (cleanup), P (performance), N (notes), A (arbitrage).
+
 ---
 
 ## 5. Open Positions Snapshot
 
-*Captured 2026-04-25. This section will be stale by tomorrow but the snapshot is worth preserving for the document's first version.*
+*Captured 2026-04-25 22:30 UTC, post-B1 settlements. This section ages quickly — the snapshot becomes stale within 24 h as new MC trades open and old ones settle. Update protocol: refresh whenever the open-positions list materially changes, but always preserve prior snapshots inline rather than rewriting them in place, so the history of position state is recoverable.*
 
-5 open MC barrier positions, 0 open technical-brain positions (5-min markets clear within minutes by design):
+### Current snapshot (post-B1, 2026-04-25)
+
+2 open MC barrier positions, 0 open technical-brain positions (5-min markets clear within minutes by design):
+
+| id | ticker | dir | size | entry | age | settles |
+|---:|---|---|---:|---:|---:|---|
+| 595 | `KXBTCMAXMON-BTC-26APR30-8000000` | yes | $16.59 | 0.510 | ~41 h | 2026-04-30 |
+| 606 | `KXBTCMAXMON-BTC-26APR30-8250000` | yes | $13.66 | ~0.19 | ~40 h | 2026-04-30 |
+
+Total invested in pending positions: ~$30. Total potential payout if all win: ~$60.
+
+### Prior snapshot (pre-B1, 2026-04-25 ~14:00 UTC)
+
+5 open MC barrier positions. 3 of these (708, 709, 728 — KXBTCD-26APR2517) settled on 2026-04-25 21:00 UTC and resolved as losses post-B1 (see Section 3i). Preserved here for historical reference:
 
 | id | ticker | dir | size | entry | age | settles |
 |---:|---|---|---:|---:|---:|---|
 | 595 | `KXBTCMAXMON-BTC-26APR30-8000000` | yes | $16.59 | 0.510 | 24.1 h | 2026-04-30 |
 | 606 | `KXBTCMAXMON-BTC-26APR30-8250000` | yes | $13.66 | 0.190 | 23.3 h | 2026-04-30 |
-| 708 | `KXBTCD-26APR2517-T78749.99` | yes | $13.02 | 0.140 | 8.1 h | 2026-04-25 21:00 UTC |
-| 709 | `KXBTCD-26APR2517-T77249.99` | no | $12.46 | 0.280 | 8.1 h | 2026-04-25 21:00 UTC |
-| 728 | `KXBTCD-26APR2517-T78499.99` | yes | $14.37 | 0.100 | 0.5 h | 2026-04-25 21:00 UTC (post-S2 third position) |
+| 708 | `KXBTCD-26APR2517-T78749.99` | yes | $13.02 | 0.140 | 8.1 h | 2026-04-25 21:00 UTC → **settled, loss** |
+| 709 | `KXBTCD-26APR2517-T77249.99` | no | $12.46 | 0.280 | 8.1 h | 2026-04-25 21:00 UTC → **settled, loss** |
+| 728 | `KXBTCD-26APR2517-T78499.99` | yes | $14.37 | 0.100 | 0.5 h | 2026-04-25 21:00 UTC → **settled, loss** (post-S2 third position) |
 
-Total invested: ~$70 across both series. Total potential payout if all win: ~$235.
+### BotState (post-B1 settlements)
+
+- Bankroll: **$195.69**
+- Cumulative `total_pnl`: **−$4.31**
+- `total_trades`: **758**, `winning_trades`: **374** (all-time technical brain)
+- `BotState.total_pnl` ↔ `SUM(Trade.pnl)` drift remains documented (Section 7); not in scope to reconcile.
 
 ---
 
@@ -177,13 +261,27 @@ Total invested: ~$70 across both series. Total potential payout if all win: ~$23
 
 *Specific, dated checkpoints. Outcomes feed back into Sections 4 (parameter decisions) and 8 (roadmap re-prioritization).*
 
-### 2026-04-30 — first MC barrier settlements
+### 2026-04-25 — first MC settlements (RESOLVED)
 
-- 2× KXBTCMAXMON-26APR30 positions resolve.
-- Plus N daily KXBTCD settlements between now and then.
-- **SUCCESS:** settlements broadly align with model predictions (positions entered at >0.5 prob settle yes more often than not, scaled appropriately).
+The first MC settlements actually occurred on 2026-04-25 (3 KXBTCD daily contracts), earlier than originally framed. All three resolved as losses; full data and interpretation in Section 3i. n=3 is statistically meaningless — Wilson 95% CI is roughly [0%, 71%], so this checkpoint did not produce evidence either way. Kept here as a record that the checkpoint fired and what it told us (nothing definitive).
+
+### 2026-04-30 — first KXBTCMAXMON monthly settlements
+
+*Reframed in slice N4: the original "first MC barrier settlements" framing implied April 30 was the first settlement event, but daily KXBTCD settlements have been arriving since April 25. April 30 is now the first **monthly-cadence** settlement event.*
+
+- 2× KXBTCMAXMON-26APR30 positions (trades 595, 606) resolve.
+- Plus accumulated KXBTCD daily settlements between 2026-04-25 and 2026-04-30 (expected n=8–13 daily-cohort points by month-end at current open-position rate).
+- **SUCCESS:** combined daily + monthly settlements broadly align with model predictions (positions entered at >0.5 prob settle yes more often than not, scaled appropriately).
 - **AMBIGUOUS:** small sample, mixed results, no clear signal.
 - **FAILURE:** settlements contradict predictions strongly enough to warrant reverting S2 and questioning the GBM pricer.
+
+### Interim — daily KXBTCD settlement accumulation (continuous)
+
+*Added in slice N4. Now that B1 has unblocked settlements, daily-cadence settlements arrive ~daily and are the fastest way to accumulate sample.*
+
+- Each KXBTCD contract settles within ~24 h of entry. At current open-position rate (post-S2 cap = 3 daily slots) and trade frequency (~4 MC trades/day), expect 5–10 additional daily settlements between 2026-04-25 and 2026-04-30, then ~30/month thereafter.
+- **Decision gate at n≈30 daily settlements (estimated mid-May 2026):** evaluate calibration of the GBM pricer on daily-cadence data. If realized win rate on entries with model_p > 0.5 cleanly differs from model_p — particularly if it's persistently lower — that's evidence the GBM-with-realized-vol pricing is mis-calibrated, which promotes the GARCH item in Section 11.1 from contingent to active.
+- This is a continuous-monitoring checkpoint, not a single date.
 
 ### 2026-05-21 — first BTC technical brain statistical evaluation
 
@@ -198,6 +296,7 @@ Total invested: ~$70 across both series. Total potential payout if all win: ~$23
 
 - If by this date the MC strategy hasn't shown clear positive edge across multiple months of settlements: **shut it down or pivot.**
 - This is the "don't run a losing strategy forever" gate. Documented in `MC_PILOT_BANKROLL_USD` comment.
+- **Now actually evaluable** post-B1: prior to 2026-04-25, the bot's settlement loop never executed end-to-end, so this stopping criterion was unreachable in practice. The 90-day clock effectively starts 2026-04-25 (first real settlements), not the original `MC_PILOT_BANKROLL_USD` introduction date. Total elapsed days at this checkpoint: ~89 days of *settled* data.
 
 ---
 
@@ -246,11 +345,16 @@ Total invested: ~$70 across both series. Total potential payout if all win: ~$23
 
 ### Completed since last update
 
+*Listed in chronological commit order.*
+
 | slice | commit | description | completed |
 |---|---|---|---|
 | **C1** | `3a40109` | Delete dormant `backend/ai/` scaffolding (1,133 LOC, 5 files + AILog model + 2 PyPI deps + 4 config settings) | 2026-04-25 |
 | **C2** | `b3b5653` | Sync `.env.example` — fix `KELLY_FRACTION` 0.25→0.10 drift, remove dead-econ-pipeline `FRED_API_KEY` / `BLS_API_KEY` placeholders | 2026-04-25 |
 | **P1** | `3ddbd82` | Parallelize per-underlying scan loop in `scan_for_signals` via `asyncio.gather` — eliminates scheduler timing pressure (`/api/dashboard` 9.7s → 4.0s, ~58% reduction) | 2026-04-25 |
+| **N3** | `c38fb00` | Add `STRATEGY3_SCOPE.md` — cross-platform arbitrage scoping doc (Polymarket BTC ↔ Kalshi KXBTCD pairs trade); top-level artifact alongside RESEARCH_NOTES | 2026-04-25 |
+| **P2** | `dc0861f` | Cache `scan_for_signals` results keyed on `(underlying, scan_cycle_id)` so dashboard reuses scheduler-produced scans (`/api/dashboard` 4.0s → ~2.0s, additional ~50% reduction) | 2026-04-25 |
+| **B1** | `da6ce41` | Fix Kalshi settlement to use public market endpoint (no credentials needed) — replaces silently-failing credential gate. **First MC settlements ever recorded in DB.** +10 unit tests in new `tests/test_settlement.py` (197→207). | 2026-04-25 |
 
 ---
 
@@ -275,7 +379,7 @@ This document is a living artifact. **Update it after every meaningful event:**
 | event | update target |
 |---|---|
 | Diagnostic produces meaningful findings | add to Section 3 |
-| Parameter change committed (S-slice) | add a slice entry to Section 4 |
+| Code change committed (S/P/B slice) | add a slice entry to Section 4 |
 | Checkpoint reached (Section 6 dates) | update Section 6 with what happened |
 | New question worth investigating arises | add to Section 9 |
 | Roadmap item completed or removed | update Section 8 |
@@ -288,7 +392,14 @@ This document is a living artifact. **Update it after every meaningful event:**
 - Don't speculate beyond what evidence supports. Flag wide CIs and small-sample findings explicitly.
 - Keep sections scannable: short paragraphs and bullet lists, not walls of text.
 - When a finding contradicts a prior entry, **don't delete the prior entry** — append a dated update so the history of belief is preserved.
-- Commit conventions: documentation-only updates use `slice N{n}: ...` (N for "notes"); code changes use `slice S{n}: ...` (S for "slice").
+- Commit conventions — slice prefix taxonomy (current as of slice N4):
+  - **S** — strategy/parameter changes that alter trade decisions or sizing (`MIN_EDGE_THRESHOLD`, concentration caps, etc.)
+  - **T** — tooling and diagnostic harnesses (replay scripts, audit utilities)
+  - **C** — cleanup and dead-code deletion
+  - **P** — performance and infrastructure (correctness-neutral latency, parallelization, caching)
+  - **N** — notes and documentation updates to this file or other top-level artifacts
+  - **A** — arbitrage / strategy 3 work (introduced with `STRATEGY3_SCOPE.md`, slice N3)
+  - **B** — bug fixes (introduced with B1; distinct from S because correctness-restoring rather than strategy-tuning)
 
 This document complements `README.md` (what the code does today) and `ARCHITECTURE.md` (historical, marked stale). When the three disagree, this document is the source of truth for **research state**; README is the source of truth for **code shape**; ARCHITECTURE is no longer authoritative for anything.
 
@@ -296,7 +407,7 @@ This document complements `README.md` (what the code does today) and `ARCHITECTU
 
 ## 11. Long-term radar
 
-*Last meaningful update: 2026-04-25 (initial creation).*
+*Last meaningful update: 2026-04-25 (slice N4 — GARCH timing revised in 11.1).*
 
 *Captures legitimate technique/tool ideas surfaced during ideas-list reviews that are NOT immediate roadmap items but are worth tracking for future consideration. Section 11 grows as new ideas surface; the discipline for moving items in / out is in 11.6.*
 
@@ -304,7 +415,7 @@ This document complements `README.md` (what the code does today) and `ARCHITECTU
 
 Items that may become relevant depending on what existing strategy evaluations reveal.
 
-- **GARCH volatility modeling for the MC brain** — currently the MC brain's volatility estimator uses simple realized volatility from recent price history (EWMA optional, plain σ as the default). GARCH would model volatility as time-varying with autocorrelation. Becomes relevant **only if** the April 30 KXBTCMAXMON settlements (and subsequent monthly settlements) show that GBM-with-realized-vol pricing is meaningfully off. If GBM works, GARCH adds complexity without benefit. **Decision gate:** April 30 settlement evaluation per Section 6.
+- **GARCH volatility modeling for the MC brain** — currently the MC brain's volatility estimator uses simple realized volatility from recent price history (EWMA optional, plain σ as the default). GARCH would model volatility as time-varying with autocorrelation. Becomes relevant **only if** accumulated MC settlements show GBM-with-realized-vol pricing is meaningfully off. If GBM works, GARCH adds complexity without benefit. **Decision gate (revised in slice N4):** evaluate when daily-cadence settlement sample reaches **n≈30 (estimated mid-May 2026)** — earlier than the original "after April 30" framing because B1 unblocked daily settlement collection on 2026-04-25, and KXBTCD settles ~daily. The April 30 monthly settlements remain a complementary data point but daily-cohort calibration data accumulates faster. See Section 6, "Interim — daily KXBTCD settlement accumulation."
 
 - **Regime detection for cross-strategy evaluation** — already on the active roadmap (Section 8, "Possibly worth doing"); reiterating here as part of the long-term radar so it stays visible in the radar inventory. Becomes critical when market conditions change and we need to evaluate whether existing strategies' edge is regime-dependent.
 

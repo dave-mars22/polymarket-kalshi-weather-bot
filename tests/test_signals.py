@@ -216,5 +216,106 @@ class TestPerUnderlyingPendingCap(unittest.TestCase):
         self.assertFalse(would_skip)
 
 
+class TestScanForSignalsParallelism(unittest.TestCase):
+    """Slice P1: scan_for_signals fans out per-underlying work via
+    asyncio.gather. These tests pin the two properties the change is
+    supposed to deliver: actual concurrency, and per-underlying error
+    isolation."""
+
+    def _run_scan(self):
+        """Run scan_for_signals on a fresh event loop and return result + duration."""
+        import asyncio
+        import time
+        from backend.core.signals import scan_for_signals
+        loop = asyncio.new_event_loop()
+        try:
+            t0 = time.perf_counter()
+            result = loop.run_until_complete(scan_for_signals())
+            elapsed = time.perf_counter() - t0
+            return result, elapsed
+        finally:
+            loop.close()
+
+    def test_per_underlying_scans_run_concurrently(self):
+        """Mock fetch_active_crypto_markets so each underlying's call sleeps
+        0.5s before returning []. Sequential = ~2s total (4 × 0.5s); parallel
+        = ~0.5s. We assert <1.0s, which is well below the sequential floor
+        but well above any plausible parallel time even on a slow machine."""
+        import asyncio
+        from unittest.mock import patch as _patch
+
+        async def slow_fetch(underlying):
+            await asyncio.sleep(0.5)
+            return []  # no markets → no signals → fast inner loop
+
+        with _patch(
+            "backend.core.signals.fetch_active_crypto_markets",
+            new=slow_fetch,
+        ):
+            with _patch.object(
+                settings, "CRYPTO_TECH_UNDERLYINGS", "BTC,ETH,SOL,XRP"
+            ):
+                with _patch.object(settings, "CRYPTO_TECH_ENABLED", True):
+                    result, elapsed = self._run_scan()
+        self.assertEqual(result, [], "no markets mocked → no signals expected")
+        # Sequential lower bound is 4 × 0.5s = 2.0s. Parallel upper bound is
+        # 0.5s + asyncio overhead. We allow up to 1.0s as a generous ceiling
+        # that still cleanly excludes sequential.
+        self.assertLess(
+            elapsed, 1.0,
+            f"scan took {elapsed:.2f}s — that's longer than parallel should be "
+            f"and suggests the loop reverted to sequential",
+        )
+
+    def test_one_underlyings_failure_does_not_break_the_others(self):
+        """If fetch_active_crypto_markets raises for one underlying, the
+        other underlyings' results must still be collected. The helper
+        catches its own errors and returns [] for the failing underlying."""
+        import asyncio
+        from unittest.mock import patch as _patch
+
+        call_log = []
+
+        async def selective_fetch(underlying):
+            call_log.append(underlying)
+            if underlying == "ETH":
+                raise RuntimeError("simulated ETH adapter outage")
+            return []  # other underlyings: no markets
+
+        with _patch(
+            "backend.core.signals.fetch_active_crypto_markets",
+            new=selective_fetch,
+        ):
+            with _patch.object(
+                settings, "CRYPTO_TECH_UNDERLYINGS", "BTC,ETH,SOL,XRP"
+            ):
+                with _patch.object(settings, "CRYPTO_TECH_ENABLED", True):
+                    result, _elapsed = self._run_scan()
+
+        # All four underlyings were attempted (gather doesn't short-circuit
+        # on the failed one).
+        self.assertEqual(set(call_log), {"BTC", "ETH", "SOL", "XRP"})
+        # ETH's failure produced no signals; the other three returned [];
+        # net result is no signals, but importantly: scan_for_signals did
+        # not raise.
+        self.assertEqual(result, [])
+
+    def test_disabled_brain_short_circuits(self):
+        """Sanity: setting CRYPTO_TECH_ENABLED=False still bypasses the
+        whole scan including the gather call. Pre-P1 behavior preserved."""
+        from unittest.mock import patch as _patch
+
+        async def should_not_be_called(underlying):
+            raise AssertionError("fetch should not be called when disabled")
+
+        with _patch(
+            "backend.core.signals.fetch_active_crypto_markets",
+            new=should_not_be_called,
+        ):
+            with _patch.object(settings, "CRYPTO_TECH_ENABLED", False):
+                result, _elapsed = self._run_scan()
+        self.assertEqual(result, [])
+
+
 if __name__ == "__main__":
     unittest.main()

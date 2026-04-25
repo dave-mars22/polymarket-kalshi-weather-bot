@@ -382,14 +382,56 @@ async def generate_crypto_tech_signal(
     )
 
 
+async def _scan_one_underlying(underlying: str) -> List[TradingSignal]:
+    """Scan all markets for one underlying and return its signals.
+
+    Slice P1 helper: per-underlying error isolation. Failures in market
+    fetch or per-market signal generation are logged but don't propagate
+    — a hard failure (e.g., the exchange API is down for one asset) just
+    yields an empty list for that underlying so the others' results are
+    preserved when scan_for_signals fans us out via asyncio.gather.
+
+    The per-market sleep(0.1) is the per-exchange rate-limit throttle and
+    stays inside this helper — it's the SAME throttle as before for any
+    single underlying. Different underlyings hit DIFFERENT exchange
+    products (BTC-USD vs ETH-USD vs SOL-USD vs XRP-USD on Coinbase, etc.)
+    so concurrent fan-out across underlyings does not stack rate-limit
+    pressure on any one product.
+    """
+    try:
+        markets = await fetch_active_crypto_markets(underlying)
+    except Exception as e:
+        logger.error(f"Failed to fetch {underlying} markets: {e}")
+        return []
+    logger.info(f"Found {len(markets)} active {underlying} 5-min markets")
+
+    out: List[TradingSignal] = []
+    for market in markets:
+        try:
+            signal = await generate_crypto_tech_signal(market, underlying)
+            if signal:
+                out.append(signal)
+        except Exception as e:
+            logger.debug(f"Signal generation failed for {market.slug}: {e}")
+        await asyncio.sleep(0.1)
+    return out
+
+
 async def scan_for_signals() -> List[TradingSignal]:
     """Scan crypto 5-min markets for every enabled underlying.
 
-    Iterates settings.CRYPTO_TECH_UNDERLYINGS sequentially (parallel async
-    is a later optimization; sequential keeps cycle budget predictable and
-    respects per-exchange rate limits). Returns all signals in one list
-    with TradingSignal.underlying identifying the asset. Gated by
-    settings.CRYPTO_TECH_ENABLED; returns [] if disabled.
+    Slice P1: per-underlying scans run concurrently via asyncio.gather.
+    Underlyings target separate exchange products and separate Polymarket
+    market sets, so they're naturally independent. Total scan time drops
+    from sum(per_underlying_time) to ~max(per_underlying_time), which
+    eliminates the scheduler timing pressure observed pre-P1 (181 missed
+    firings + 6 actual scan skips per 12h on a 60s scan budget).
+
+    Same trades, same decisions: signals are deduplicated, sorted by
+    |edge|, and persisted in identical order to the pre-P1 implementation.
+    The fan-out is purely a timing change.
+
+    Gated by settings.CRYPTO_TECH_ENABLED; returns [] if disabled.
     """
     signals: List[TradingSignal] = []
     if not settings.CRYPTO_TECH_ENABLED:
@@ -401,22 +443,16 @@ async def scan_for_signals() -> List[TradingSignal]:
     logger.info("=" * 50)
     logger.info(f"CRYPTO 5-MIN SCAN: underlyings={underlyings}")
 
-    for underlying in underlyings:
-        try:
-            markets = await fetch_active_crypto_markets(underlying)
-        except Exception as e:
-            logger.error(f"Failed to fetch {underlying} markets: {e}")
-            continue
-        logger.info(f"Found {len(markets)} active {underlying} 5-min markets")
-
-        for market in markets:
-            try:
-                signal = await generate_crypto_tech_signal(market, underlying)
-                if signal:
-                    signals.append(signal)
-            except Exception as e:
-                logger.debug(f"Signal generation failed for {market.slug}: {e}")
-            await asyncio.sleep(0.1)
+    # _scan_one_underlying catches its own per-underlying / per-market
+    # errors and returns [] on hard failure. With that contract,
+    # return_exceptions=False is correct — anything that escapes the
+    # helper is a real bug we want to crash loudly on, not swallow.
+    per_underlying_results = await asyncio.gather(
+        *[_scan_one_underlying(u) for u in underlyings],
+        return_exceptions=False,
+    )
+    for result in per_underlying_results:
+        signals.extend(result)
 
     signals.sort(key=lambda s: abs(s.edge), reverse=True)
 

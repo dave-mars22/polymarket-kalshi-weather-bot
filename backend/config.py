@@ -39,7 +39,17 @@ class Settings(BaseSettings):
     # BTC 5-min specific settings
     SCAN_INTERVAL_SECONDS: int = 60  # Scan every minute
     SETTLEMENT_INTERVAL_SECONDS: int = 120  # Check settlements every 2 min
-    MIN_EDGE_THRESHOLD: float = 0.02  # 2% edge required — these are 50/50 markets
+    # Min edge required to enter a BTC trade. Set to 5% based on a diagnostic
+    # of 718 settled BTC trades (analysis run 2026-04-24):
+    #   - trades with |edge| < 5%:  n=210, win rate 44.3%, cumulative -$150
+    #   - trades with |edge| >= 5%: n=496, win rate ~52%, cumulative +$200
+    # The 5% gate cleanly separates a losing population from a marginally
+    # profitable one. The .env override has been 0.05 since approximately
+    # 2026-04-21 (latest sub-5% trade in the DB is id=523 at 00:55 UTC that
+    # day; Apr 22 onward the bot only generated >=5% trades). This source
+    # default is synced to match so the runtime can't silently drift back
+    # to 0.02 if .env is reset or recreated from .env.example.
+    MIN_EDGE_THRESHOLD: float = 0.05
     MAX_ENTRY_PRICE: float = 0.55  # Enter up to 55c
     MAX_TRADES_PER_WINDOW: int = 1
     MAX_TOTAL_PENDING_TRADES: int = 20

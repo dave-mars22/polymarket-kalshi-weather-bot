@@ -13,7 +13,7 @@ import re
 from backend.config import settings
 from backend.models.database import (
     get_db, init_db, SessionLocal,
-    Signal, Trade, BotState, AILog, ScanLog
+    Signal, Trade, BotState, ScanLog
 )
 from backend.core.signals import scan_for_signals, TradingSignal
 from backend.data.crypto_markets import fetch_active_crypto_markets, CryptoUpDownMarket
@@ -1144,7 +1144,6 @@ async def reset_bot(db: Session = Depends(get_db)):
             state.total_pnl = 0.0
             state.is_running = True
 
-        ai_logs_deleted = db.query(AILog).delete()
         db.commit()
 
         log_event("success", f"Bot reset: {trades_deleted} trades deleted. Fresh start with ${settings.INITIAL_BANKROLL:,.2f}")
@@ -1152,7 +1151,6 @@ async def reset_bot(db: Session = Depends(get_db)):
         return {
             "status": "reset",
             "trades_deleted": trades_deleted,
-            "ai_logs_deleted": ai_logs_deleted,
             "new_bankroll": settings.INITIAL_BANKROLL
         }
 

@@ -18,16 +18,6 @@ class Settings(BaseSettings):
     KALSHI_PRIVATE_KEY_PATH: Optional[str] = None
     KALSHI_ENABLED: bool = True
 
-    # AI API Keys
-    GROQ_API_KEY: Optional[str] = None
-
-    # AI Model Configuration
-    GROQ_MODEL: str = "llama-3.1-8b-instant"
-
-    # AI Feature Flags
-    AI_LOG_ALL_CALLS: bool = True
-    AI_DAILY_BUDGET_USD: float = 1.0
-
     # Bot settings - BTC 5-MIN TRADING
     SIMULATION_MODE: bool = True
     INITIAL_BANKROLL: float = 10000.0

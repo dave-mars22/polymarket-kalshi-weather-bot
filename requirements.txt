@@ -22,10 +22,6 @@ yfinance>=0.2.40  # equity-index history + spot for monte_carlo brain
 # Scheduling
 apscheduler==3.10.4
 
-# AI / LLM
-anthropic>=0.40.0
-groq>=0.4.0
-
 # Logging
 structlog>=24.1.0
 

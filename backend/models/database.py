@@ -117,28 +117,6 @@ class Signal(Base):
     features = Column(JSON, default=dict, nullable=False)
 
 
-class AILog(Base):
-    """Log of all AI API calls."""
-    __tablename__ = "ai_logs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-    provider = Column(String, index=True)
-    model = Column(String)
-
-    prompt = Column(String)
-    response = Column(String)
-    call_type = Column(String, index=True)
-
-    latency_ms = Column(Float)
-    tokens_used = Column(Integer)
-    cost_usd = Column(Float)
-
-    related_market = Column(String, nullable=True)
-    success = Column(Boolean, default=True)
-    error = Column(String, nullable=True)
-
-
 class ScanLog(Base):
     """Log of each market scan run."""
     __tablename__ = "scan_logs"

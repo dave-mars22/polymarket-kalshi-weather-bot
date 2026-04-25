@@ -225,25 +225,60 @@ async def check_market_settlement(trade: Trade) -> Tuple[bool, Optional[float], 
     return True, settlement_value, pnl
 
 
-async def _fetch_kalshi_resolution(ticker: str) -> Tuple[bool, Optional[float]]:
-    """Fetch resolution status for a Kalshi market."""
+_KALSHI_PUBLIC_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+
+
+async def _fetch_kalshi_resolution(
+    ticker: str,
+    *,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> Tuple[bool, Optional[float]]:
+    """Fetch resolution status for a Kalshi market via the public market
+    endpoint.
+
+    Slice B1 fix: this function previously bailed via
+    `kalshi_credentials_present()` and never made an API call, leaving
+    every MC trade in pending state forever. The Kalshi
+    /trade-api/v2/markets/{ticker} endpoint is publicly readable — no
+    auth header required. Authenticated requests are only needed for
+    writes (placing orders, querying private balance), not for reading
+    public market resolution status. Verified via direct curl on
+    2026-04-25; see commit body for the full bug story.
+
+    Returns (is_resolved, settlement_value):
+      - status == 'finalized' AND result == 'yes' → (True, 1.0)
+      - status == 'finalized' AND result == 'no'  → (True, 0.0)
+      - any other state (open, ambiguous, malformed, HTTP error)
+        → (False, None) so the settlement loop tries again next cycle
+
+    `http_client` is an injection seam for tests (matches the same
+    pattern in mc_execution.fetch_current_ask and spot_prices.fetch_spot);
+    production callers leave it None to get a fresh per-call client.
+    """
+    url = f"{_KALSHI_PUBLIC_BASE}/markets/{ticker}"
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient(timeout=15.0)
     try:
-        from backend.data.kalshi_client import KalshiClient, kalshi_credentials_present
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+        finally:
+            if owns_client:
+                await client.aclose()
 
-        if not kalshi_credentials_present():
-            return False, None
-
-        client = KalshiClient()
-        data = await client.get_market(ticker)
-        market = data.get("market", data)
-
+        # Response shape per Kalshi v2 docs and verified live: top-level
+        # {"market": {...}}. Be tolerant of an unwrapped variant just in
+        # case (some endpoints return the resource directly).
+        market = data.get("market", data) if isinstance(data, dict) else {}
         status = market.get("status", "")
         result = market.get("result", "")
 
+        # Strict equality — Kalshi's API contract is case-explicit.
         if status in ("finalized", "determined") and result:
             if result == "yes":
                 return True, 1.0
-            elif result == "no":
+            if result == "no":
                 return True, 0.0
 
         return False, None

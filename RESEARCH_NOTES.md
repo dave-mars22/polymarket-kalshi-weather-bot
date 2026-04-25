@@ -222,8 +222,6 @@ Total invested: ~$70 across both series. Total potential payout if all win: ~$23
 3. **Logistic regression on features** — replace hand-coded composite weights with learned weights. Worth revisiting late summer 2026 when 500–1,000 feature-tagged trades exist.
 4. **Drop volatility from composite scoring** — confirmed dead weight in two independent diagnostics (3b). Do as cleanup whenever signal logic is being touched.
 5. **Investigate the 8–10% edge dip** — replicated across two cohorts (3a, 3e). Worth revisiting when post-change 8–10% bucket reaches n≈200, ~30–40 days from now.
-6. **Delete dead AI scaffolding** — 1,133 lines, 0 imports, 0 rows in AILog. Clean cleanup commit when convenient.
-7. **Clean up `.env.example` drift** — `KELLY_FRACTION=0.25` vs default 0.10, `FRED_API_KEY`/`BLS_API_KEY` from dead econ pipeline. ~5-line cleanup.
 
 ### Possibly worth doing (depends on findings)
 
@@ -245,6 +243,14 @@ Total invested: ~$70 across both series. Total potential payout if all win: ~$23
 - **Adding features without testing existing ones first.** Premature optimization.
 - **Lowering edge threshold below 5%.** Diagnostic showed sub-5% trades lose money.
 - **Stock price prediction with ML at this data scale.** Known dead end.
+
+### Completed since last update
+
+| slice | commit | description | completed |
+|---|---|---|---|
+| **C1** | `3a40109` | Delete dormant `backend/ai/` scaffolding (1,133 LOC, 5 files + AILog model + 2 PyPI deps + 4 config settings) | 2026-04-25 |
+| **C2** | `b3b5653` | Sync `.env.example` — fix `KELLY_FRACTION` 0.25→0.10 drift, remove dead-econ-pipeline `FRED_API_KEY` / `BLS_API_KEY` placeholders | 2026-04-25 |
+| **P1** | `3ddbd82` | Parallelize per-underlying scan loop in `scan_for_signals` via `asyncio.gather` — eliminates scheduler timing pressure (`/api/dashboard` 9.7s → 4.0s, ~58% reduction) | 2026-04-25 |
 
 ---
 
@@ -285,3 +291,70 @@ This document is a living artifact. **Update it after every meaningful event:**
 - Commit conventions: documentation-only updates use `slice N{n}: ...` (N for "notes"); code changes use `slice S{n}: ...` (S for "slice").
 
 This document complements `README.md` (what the code does today) and `ARCHITECTURE.md` (historical, marked stale). When the three disagree, this document is the source of truth for **research state**; README is the source of truth for **code shape**; ARCHITECTURE is no longer authoritative for anything.
+
+---
+
+## 11. Long-term radar
+
+*Last meaningful update: 2026-04-25 (initial creation).*
+
+*Captures legitimate technique/tool ideas surfaced during ideas-list reviews that are NOT immediate roadmap items but are worth tracking for future consideration. Section 11 grows as new ideas surface; the discipline for moving items in / out is in 11.6.*
+
+### 11.1 Contingent technical upgrades
+
+Items that may become relevant depending on what existing strategy evaluations reveal.
+
+- **GARCH volatility modeling for the MC brain** — currently the MC brain's volatility estimator uses simple realized volatility from recent price history (EWMA optional, plain σ as the default). GARCH would model volatility as time-varying with autocorrelation. Becomes relevant **only if** the April 30 KXBTCMAXMON settlements (and subsequent monthly settlements) show that GBM-with-realized-vol pricing is meaningfully off. If GBM works, GARCH adds complexity without benefit. **Decision gate:** April 30 settlement evaluation per Section 6.
+
+- **Regime detection for cross-strategy evaluation** — already on the active roadmap (Section 8, "Possibly worth doing"); reiterating here as part of the long-term radar so it stays visible in the radar inventory. Becomes critical when market conditions change and we need to evaluate whether existing strategies' edge is regime-dependent.
+
+### 11.2 Tools and references to study
+
+External resources worth keeping in mind for future projects.
+
+- **`poly_data` repository — https://github.com/warproxxx/poly_data** — pipeline for ingesting Polymarket order events and processed trades into structured CSVs. Directly relevant for the eventual backtester project (Section 8 item #1). Architecture worth studying: resumable, deduplicates, keeps historical data updated incrementally — the backtester will need all three properties.
+
+- **Hull, "Options, Futures, and Other Derivatives"** — standard quant finance textbook. Foundation reading for understanding Black-Scholes / GBM (already implemented in MC brain), Greeks, volatility models, and the math underlying barrier option pricing. Read over months, not as a project — chapters useful for this codebase: BSM derivation, barrier options, volatility models (which previews 11.1's GARCH item).
+
+### 11.3 Concept inventory (for general knowledge)
+
+Theoretical frameworks worth understanding even though they're not implementation projects.
+
+- **Black-Scholes derivation and the GBM SDE that underlies it** — already in your bot via the MC brain. Understanding the math deepens the ability to evaluate MC pricer accuracy and to recognize when assumptions break (constant vol, no drift over short horizons, log-normal returns).
+- **Markowitz portfolio theory** — becomes relevant if portfolio scale ever justifies cross-position optimization (correlation between simultaneous positions). Not currently relevant at 5-position scale.
+- **Fama's market efficiency hypothesis** — relevant framing for "why does any retail strategy have edge?" Useful skepticism: any apparent edge survives only if the market is inefficient *in the specific way* the strategy assumes.
+- **CAPM / risk-return models** — useful general concept; doesn't apply directly to prediction markets (no broad market beta to regress against), but the framing of "how much extra return per unit of risk" generalizes.
+
+### 11.4 Pairs trading frame for strategy 3
+
+"Pairs trading" is the canonical name for the strategy 3 cross-platform arbitrage approach being scoped. The standard pairs trading frame uses cointegration tests and z-scores on the spread between two correlated assets. The strategy 3 spread-detection layer can adopt this language explicitly:
+
+- Polymarket BTC market and Kalshi KXBTCD market are the **pair**.
+- The **spread** is observed over time.
+- **Z-score thresholds** (e.g., 2σ) could be used as an alternative to fixed-bps thresholds for the tradeable criterion.
+- **Cointegration tests** (Engle-Granger, Johansen) could validate that the markets *should* move together — a defense against trading apparent spreads on actually-different events that happen to look similar.
+
+This is a **future refinement, not MVP scope.** The MVP uses fixed bps thresholds (200 bps observable, 400 bps tradeable) per the strategy 3 scoping document. After the 30-day evaluation, if data is rich enough, pairs trading frame becomes the natural upgrade path.
+
+### 11.5 Explicitly out of scope (reconfirmed)
+
+These items appeared in the ideas-list review and are explicitly NOT going on the roadmap. Listed here so they don't get re-proposed without new evidence.
+
+- **ML / deep learning / neural networks in the trading loop** — covered in Section 7. Sample size insufficient (≤200 settled trades per strategy), would overfit and destroy interpretability.
+- **LLMs in the trading decision loop** — covered in Section 7. Antipattern; numerical prediction isn't what LLMs do well.
+- **Equity research tools (DCF models, screeners, earnings analysis)** — your bot trades prediction markets and crypto derivatives, not equities. Wrong domain.
+- **Bank/firm-style framework labels ("Goldman-grade", "Citadel-grade", etc.)** — not actionable; multi-decade efforts by hundreds of engineers, not a personal project scope.
+- **Time-series momentum, macro regime allocation, factor models** — apply to continuous-price multi-asset portfolios, not your prediction market structure.
+- **Mean reversion as a primary strategy** — doesn't fit the binary/barrier resolution structure of your markets.
+- **HFT-style techniques (spectral decomposition, cross-exchange order flow at the microstructure level)** — wrong scale and latency profile for retail prediction markets.
+- **Implied volatility surface builder** — you don't trade options.
+- **CVaR portfolio optimization** — premature at 5-position scale.
+
+### 11.6 Update protocol for this section
+
+Section 11 grows over time as new ideas surface. The discipline:
+
+- New ideas go into 11.1 (contingent), 11.2 (tools), or 11.3 (concepts) as appropriate.
+- Items that get **promoted** to active roadmap (Section 8) move out of Section 11.
+- Items that get **explicitly rejected** move to 11.5 with reasoning.
+- This section is **descriptive** of "what we're considering," not **prescriptive** of "what we'll build."

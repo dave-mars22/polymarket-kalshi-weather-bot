@@ -1,0 +1,8 @@
+# Dependencies for /notebooks/ — learning artifacts, not production code.
+# Installed separately from requirements.txt so the production deployment
+# surface stays minimal. To install: venv/bin/pip install -r requirements-notebooks.txt
+matplotlib>=3.8
+jupyter>=1.0
+nbformat>=5.9
+nbconvert>=7.0
+ipykernel>=6.0

@@ -78,6 +78,37 @@ KALSHI_SERIES: List[Tuple[str, str, str]] = (
     KALSHI_CRYPTO_SERIES + KALSHI_EQUITY_INDEX_SERIES
 )
 
+# Slice S2: settlement cadence per series. Used by mc_execution.cap_for_series
+# to apply different per-series concentration caps based on how long each
+# contract holds capital. Series not listed here resolve to "other" and use
+# the conservative default cap (settings.MC_MAX_OPEN_PER_SERIES_OTHER).
+SERIES_CADENCE: dict = {
+    # Crypto daily — 24h settlement
+    "KXBTCD":      "daily",
+    "KXBCH":       "daily",
+    "KXSHIBA":     "daily",
+    "KXAVAXD":     "daily",
+    "KXBTCMAXD":   "daily",
+    # Crypto monthly — multi-week capital lock
+    "KXBTCMINMON": "monthly",
+    "KXBTCMAXMON": "monthly",
+    # Crypto yearly — long-duration outlier
+    "KXBTCY":      "yearly",
+    # Equity-index series intentionally not included; they aren't scanned today
+    # (mc_signals.py passes asset_classes=["crypto"] only). When equity-index
+    # gets enabled, add their cadences here.
+}
+
+
+def cadence_for_series(series_ticker: str) -> str:
+    """Return 'daily' | 'monthly' | 'yearly' | 'other' for a Kalshi series.
+
+    Unknown series fall back to 'other' so the conservative cap applies —
+    we'd rather under-trade an unknown series than accidentally allow
+    high concentration on a long-duration contract.
+    """
+    return SERIES_CADENCE.get(series_ticker, "other")
+
 _KALSHI_PAGE_LIMIT = 200
 
 

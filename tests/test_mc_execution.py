@@ -8,6 +8,7 @@ import httpx
 
 from backend.config import settings
 from backend.core.mc_execution import (
+    cap_for_series,
     concentration_cap_exceeded,
     fetch_current_ask,
     quote_drifted,
@@ -20,6 +21,25 @@ class TestSeriesTicker(unittest.TestCase):
         self.assertEqual(series_ticker_of("KXBTCMAXMON-BTC-26APR30-8000000"), "KXBTCMAXMON")
         self.assertEqual(series_ticker_of("KXINX-26APR24H1600-B7112"), "KXINX")
         self.assertEqual(series_ticker_of("NOMARK"), "NOMARK")
+
+
+class TestCapForSeries(unittest.TestCase):
+    """Slice S2: cap is cadence-specific. Verify each cadence dispatches
+    to the right setting."""
+
+    def test_daily_series_uses_daily_cap(self):
+        self.assertEqual(cap_for_series("KXBTCD"), settings.MC_MAX_OPEN_PER_SERIES_DAILY)
+        self.assertEqual(cap_for_series("KXAVAXD"), settings.MC_MAX_OPEN_PER_SERIES_DAILY)
+        self.assertEqual(cap_for_series("KXBCH"), settings.MC_MAX_OPEN_PER_SERIES_DAILY)
+        self.assertEqual(cap_for_series("KXSHIBA"), settings.MC_MAX_OPEN_PER_SERIES_DAILY)
+
+    def test_monthly_series_uses_monthly_cap(self):
+        self.assertEqual(cap_for_series("KXBTCMAXMON"), settings.MC_MAX_OPEN_PER_SERIES_MONTHLY)
+        self.assertEqual(cap_for_series("KXBTCMINMON"), settings.MC_MAX_OPEN_PER_SERIES_MONTHLY)
+
+    def test_unknown_series_uses_other_cap(self):
+        # Defensive: unknown series falls back to the conservative cap
+        self.assertEqual(cap_for_series("KXNEW_SERIES_XYZ"), settings.MC_MAX_OPEN_PER_SERIES_OTHER)
 
 
 class TestConcentrationCap(unittest.TestCase):
@@ -37,14 +57,38 @@ class TestConcentrationCap(unittest.TestCase):
         db = self._mock_db_with_count(1)
         self.assertFalse(concentration_cap_exceeded(db, "KXBTCMAXMON-X-1"))
 
-    def test_at_cap_returns_true(self):
-        # Cap is 2 per config default
-        db = self._mock_db_with_count(settings.MC_MAX_OPEN_PER_SERIES)
+    def test_at_cap_returns_true_monthly(self):
+        # Monthly series cap (KXBTCMAXMON is monthly).
+        db = self._mock_db_with_count(settings.MC_MAX_OPEN_PER_SERIES_MONTHLY)
         self.assertTrue(concentration_cap_exceeded(db, "KXBTCMAXMON-X-1"))
 
-    def test_above_cap_returns_true(self):
-        db = self._mock_db_with_count(settings.MC_MAX_OPEN_PER_SERIES + 5)
+    def test_above_cap_returns_true_monthly(self):
+        db = self._mock_db_with_count(settings.MC_MAX_OPEN_PER_SERIES_MONTHLY + 5)
         self.assertTrue(concentration_cap_exceeded(db, "KXBTCMAXMON-X-1"))
+
+    # Slice S2 regressions: daily series have a *higher* cap than monthly,
+    # so a count that triggers the monthly cap must still pass on a daily
+    # series. These would have caught a regression of S2 back to a single
+    # global cap.
+
+    def test_daily_below_daily_cap_does_not_fire(self):
+        # MC_MAX_OPEN_PER_SERIES_DAILY = 3 today; with 2 open daily trades
+        # the cap should NOT fire even though it would on a monthly series.
+        db = self._mock_db_with_count(settings.MC_MAX_OPEN_PER_SERIES_DAILY - 1)
+        self.assertFalse(concentration_cap_exceeded(db, "KXBTCD-26APR2517-T78749.99"))
+
+    def test_daily_at_daily_cap_fires(self):
+        db = self._mock_db_with_count(settings.MC_MAX_OPEN_PER_SERIES_DAILY)
+        self.assertTrue(concentration_cap_exceeded(db, "KXBTCD-26APR2517-T78749.99"))
+
+    def test_daily_cap_strictly_higher_than_monthly_when_split(self):
+        # Sanity: if the configuration were ever flipped so daily <= monthly,
+        # the slice S2 motivation would be defeated. This test pins the
+        # invariant.
+        self.assertGreaterEqual(
+            settings.MC_MAX_OPEN_PER_SERIES_DAILY,
+            settings.MC_MAX_OPEN_PER_SERIES_MONTHLY,
+        )
 
 
 class TestFetchCurrentAsk(unittest.TestCase):

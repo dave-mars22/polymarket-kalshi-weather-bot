@@ -261,6 +261,7 @@ async def mc_scan_and_trade_job():
     try:
         from backend.core.mc_signals import scan_for_mc_signals, persist_mc_signals
         from backend.core.mc_execution import (
+            cap_for_series,
             concentration_cap_exceeded,
             fetch_current_ask,
             quote_drifted,
@@ -300,13 +301,14 @@ async def mc_scan_and_trade_job():
             for signal in actionable[: settings.MC_MAX_TRADES_PER_SCAN]:
                 ticker = signal.market.ticker
 
-                # Guard 1: per-series concentration
+                # Guard 1: per-series concentration (cap is cadence-specific
+                # post-S2 — see mc_execution.cap_for_series).
                 if concentration_cap_exceeded(db, ticker):
                     series = series_ticker_of(ticker)
                     log_event(
                         "info",
                         f"[MC] skip {ticker}: concentration cap in series {series} "
-                        f"(>= {settings.MC_MAX_OPEN_PER_SERIES} open)",
+                        f"(>= {cap_for_series(series)} open)",
                     )
                     continue
 

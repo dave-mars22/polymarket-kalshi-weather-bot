@@ -2,10 +2,15 @@
 
 Two guards are enforced in the scheduler between scan and order creation:
 
-1. Per-series concentration cap: maximum MC_MAX_OPEN_PER_SERIES open
-   positions per Kalshi series_ticker. Prevents stacking too much exposure
-   on a single monthly event (e.g., all KXBTCMAXMON-T80000 / T82500 / T85000
-   resolving on the same day).
+1. Per-series concentration cap: maximum open positions per Kalshi
+   series_ticker. Cap is cadence-specific (slice S2):
+     - daily   → settings.MC_MAX_OPEN_PER_SERIES_DAILY    (3 today)
+     - monthly → settings.MC_MAX_OPEN_PER_SERIES_MONTHLY  (2 today)
+     - other   → settings.MC_MAX_OPEN_PER_SERIES_OTHER    (2 today)
+   Prevents stacking too much exposure on a single multi-week event (e.g.,
+   all KXBTCMAXMON-T80000 / T82500 / T85000 resolving on the same day) while
+   allowing slightly more open positions on fast-settling daily contracts
+   where feedback arrives within 24 hours.
 
 2. Quote refresh: market prices at scan time can be stale by the time the
    scheduler actually creates a trade. Before persisting a Trade row we
@@ -20,7 +25,7 @@ from typing import Optional
 import httpx
 
 from backend.config import settings
-from backend.data.mc_markets import KALSHI_BASE_URL
+from backend.data.mc_markets import KALSHI_BASE_URL, cadence_for_series
 from backend.models.database import Trade
 
 logger = logging.getLogger("trading_bot")
@@ -45,11 +50,27 @@ def count_open_mc_trades_in_series(db, series_ticker: str) -> int:
     )
 
 
+def cap_for_series(series_ticker: str) -> int:
+    """Return the per-series concentration cap for this Kalshi series,
+    differentiated by settlement cadence (slice S2). Daily series have a
+    higher cap because positions resolve within 24 hours; monthly/other
+    series stay at the original conservative cap."""
+    cadence = cadence_for_series(series_ticker)
+    if cadence == "daily":
+        return settings.MC_MAX_OPEN_PER_SERIES_DAILY
+    if cadence == "monthly":
+        return settings.MC_MAX_OPEN_PER_SERIES_MONTHLY
+    return settings.MC_MAX_OPEN_PER_SERIES_OTHER
+
+
 def concentration_cap_exceeded(db, market_ticker: str) -> bool:
-    """True if placing a new trade in this series would exceed the cap."""
+    """True if placing a new trade in this series would exceed the cap.
+
+    The cap is cadence-specific — see cap_for_series.
+    """
     series = series_ticker_of(market_ticker)
     open_n = count_open_mc_trades_in_series(db, series)
-    return open_n >= settings.MC_MAX_OPEN_PER_SERIES
+    return open_n >= cap_for_series(series)
 
 
 def fetch_current_ask(

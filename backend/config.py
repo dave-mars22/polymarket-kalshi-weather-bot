@@ -113,8 +113,22 @@ class Settings(BaseSettings):
     # Quote-refresh guard: skip a trade if the ask price has moved more
     # than this many dollars from the scan-time snapshot.
     MC_QUOTE_DRIFT_TOLERANCE: float = 0.02
-    # Concentration cap: max open MC positions per Kalshi series_ticker.
-    MC_MAX_OPEN_PER_SERIES: int = 2
+    # MC concentration caps differentiated by cadence to balance data
+    # accumulation rate against capital-at-risk duration. Daily contracts
+    # settle within 24h, providing fast feedback on model accuracy — small
+    # exposure increase is low risk. Monthly contracts hold capital for
+    # weeks before settling, so the original cap of 2 is preserved to limit
+    # blast radius if the model is wrong. Decision date: 2026-04-25, with
+    # first MC settlements (April 30) still pending. This intentionally
+    # accepts more daily-series exposure to accelerate data collection
+    # ahead of the May 21 evaluation checkpoint. Slice S2.
+    #
+    # Cadence is looked up per Kalshi series_ticker via
+    # backend.data.mc_markets.cadence_for_series; concentration check lives
+    # in backend.core.mc_execution.cap_for_series.
+    MC_MAX_OPEN_PER_SERIES_DAILY: int = 3
+    MC_MAX_OPEN_PER_SERIES_MONTHLY: int = 2
+    MC_MAX_OPEN_PER_SERIES_OTHER: int = 2
 
     # === MULTI-CRYPTO TECHNICAL BRAIN ===
     CRYPTO_TECH_ENABLED: bool = True
@@ -124,7 +138,7 @@ class Settings(BaseSettings):
     CRYPTO_TECH_UNDERLYINGS: str = "BTC,ETH,SOL,XRP"
     # Per-underlying pending-trade cap. Prevents any single crypto from
     # dominating the open-trade queue and concentrating risk. Mirrors MC's
-    # MC_MAX_OPEN_PER_SERIES pattern.
+    # per-series concentration cap pattern.
     MAX_PENDING_PER_UNDERLYING: int = 8
     # Minimum 24-hour volume ($USD) on a market before we produce a signal.
     # Filters dead markets so calibration data stays clean. Observed

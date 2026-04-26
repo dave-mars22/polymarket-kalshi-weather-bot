@@ -41,8 +41,11 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the backend
-uvicorn backend.api.main:app --reload --port 8000
+# Run the backend (production mode, no auto-reload — recommended for live evaluation)
+python run.py
+
+# Or, for local development with auto-reload on file changes:
+python run_dev.py
 ```
 
 Backend will be at: http://localhost:8000
@@ -253,7 +256,8 @@ polymarket-kalshi-bot/
 │   │   └── types.ts                 # TypeScript interfaces
 │   └── package.json
 ├── requirements.txt
-├── run.py
+├── run.py                          # Production launcher (no auto-reload)
+├── run_dev.py                      # Development launcher (auto-reload)
 └── README.md
 ```
 

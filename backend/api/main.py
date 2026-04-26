@@ -21,6 +21,7 @@ from backend.models.database import (
 from backend.core.signals import scan_for_signals, get_cached_scan, TradingSignal
 from backend.core.dashboard_cache import (
     build_dashboard_cache_payload,
+    get_cached_active_markets,
     get_cached_dashboard_data,
     get_cached_micro,
 )
@@ -1182,10 +1183,22 @@ async def get_dashboard(db: Session = Depends(get_db)):
     # were trying to escape. If both cache and inline fail, btc_price_data
     # stays None and the dashboard renders without it (graceful degrade).
 
-    # Fetch windows
+    # Slice P5: BTC active markets from the per-underlying cache populated
+    # by scan_and_trade_job every 60 s. T4 measured this fetch at ~1.2 s
+    # (90 % of pre-P5 dashboard latency); the cache eliminates the HTTP
+    # round-trip on the hot path. Cache miss path (first dashboard request
+    # post-restart, before scan has fired): fall back to one inline
+    # fetch_active_crypto_markets("BTC") call, log the miss, and serve
+    # the result. The fallback does NOT update the cache —
+    # single-writer invariant; only the scan writes.
     windows = []
     try:
-        markets = await fetch_active_crypto_markets("BTC")
+        cached_markets = get_cached_active_markets("BTC")
+        if cached_markets is not None:
+            markets, _ts = cached_markets
+        else:
+            logger.info("[dashboard] active markets cache miss for BTC — building inline (one-time)")
+            markets = await fetch_active_crypto_markets("BTC")
         windows = [
             BtcWindowResponse(
                 slug=m.slug,

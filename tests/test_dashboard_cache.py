@@ -280,5 +280,103 @@ class TestPerUnderlyingMicroCache(unittest.TestCase):
         self.assertIn("ETH", second_dict)
 
 
+# =============================================================================
+# Slice P5: per-underlying active-markets cache. Mirrors P4's micro cache
+# tests above — same whole-dict-swap pattern, same accessor shape, just
+# storing List[CryptoUpDownMarket] instead of CryptoMicrostructure.
+# =============================================================================
+
+
+from datetime import datetime as _dt
+
+from backend.core.dashboard_cache import (
+    get_cached_active_markets,
+    update_cached_active_markets,
+)
+from backend.data.crypto_markets import CryptoUpDownMarket
+
+
+def _reset_active_markets_cache():
+    dc._active_markets_cache = {}
+
+
+class TestPerUnderlyingActiveMarketsCache(unittest.TestCase):
+    """State + accessors for the P5 per-underlying active-markets cache."""
+
+    def setUp(self):
+        _reset_active_markets_cache()
+
+    def tearDown(self):
+        _reset_active_markets_cache()
+
+    def _sample_market(self, slug: str = "btc-updown-5m-x", market_id: str = "abc") -> CryptoUpDownMarket:
+        # The unit tests don't go through BtcWindowResponse so naive
+        # datetimes work here, but use aware UTC for consistency with
+        # the integration tests in test_api_expansion.py.
+        from datetime import timezone as _tz
+        now = _dt.now(_tz.utc)
+        return CryptoUpDownMarket(
+            slug=slug, market_id=market_id,
+            up_price=0.5, down_price=0.5,
+            window_start=now, window_end=now,
+            volume=100.0, volume_24h=500.0, closed=False,
+        )
+
+    def test_get_returns_none_on_miss(self):
+        # Empty cache -> every underlying returns None.
+        self.assertIsNone(get_cached_active_markets("BTC"))
+        self.assertIsNone(get_cached_active_markets("ETH"))
+
+    def test_round_trip_preserves_markets_and_timestamp(self):
+        markets = [self._sample_market(market_id="m1"), self._sample_market(market_id="m2")]
+        update_cached_active_markets("BTC", markets)
+        cached = get_cached_active_markets("BTC")
+        self.assertIsNotNone(cached)
+        got_markets, got_ts = cached
+        # Defensive shallow copy stored — equal contents, distinct list object.
+        self.assertEqual([m.market_id for m in got_markets], ["m1", "m2"])
+        self.assertIsNot(got_markets, markets)
+        self.assertIsInstance(got_ts, datetime)
+
+    def test_underlying_lookup_is_case_insensitive(self):
+        # Cache normalizes to upper. Pin the contract so callers using
+        # lowercase tickers don't silently miss.
+        markets = [self._sample_market()]
+        update_cached_active_markets("btc", markets)
+        self.assertIsNotNone(get_cached_active_markets("BTC"))
+        self.assertIsNotNone(get_cached_active_markets("Btc"))
+
+    def test_multiple_underlyings_isolated(self):
+        # P5 caches all underlyings the scan sees, even though only BTC
+        # is consumed today. Pin that ETH/SOL/XRP slots are independent.
+        update_cached_active_markets("BTC", [self._sample_market(market_id="b1")])
+        update_cached_active_markets("ETH", [self._sample_market(market_id="e1")])
+        btc = get_cached_active_markets("BTC")
+        eth = get_cached_active_markets("ETH")
+        self.assertEqual(btc[0][0].market_id, "b1")
+        self.assertEqual(eth[0][0].market_id, "e1")
+        self.assertIsNone(get_cached_active_markets("SOL"))
+        self.assertIsNone(get_cached_active_markets("XRP"))
+
+    def test_update_overwrites_prior_entry_for_same_underlying(self):
+        update_cached_active_markets("BTC", [self._sample_market(market_id="old")])
+        update_cached_active_markets("BTC", [self._sample_market(market_id="new")])
+        cached = get_cached_active_markets("BTC")
+        self.assertEqual(cached[0][0].market_id, "new")
+
+    def test_update_uses_whole_dict_swap_atomicity(self):
+        # Same atomicity smoke test as the P4 cache — confirm dict identity
+        # changes on update (whole-dict-swap, not in-place mutation).
+        update_cached_active_markets("BTC", [self._sample_market()])
+        first_dict = dc._active_markets_cache
+        update_cached_active_markets("ETH", [self._sample_market()])
+        second_dict = dc._active_markets_cache
+        self.assertIsNot(first_dict, second_dict)
+        self.assertIn("BTC", first_dict)
+        self.assertNotIn("ETH", first_dict)
+        self.assertIn("BTC", second_dict)
+        self.assertIn("ETH", second_dict)
+
+
 if __name__ == "__main__":
     unittest.main()

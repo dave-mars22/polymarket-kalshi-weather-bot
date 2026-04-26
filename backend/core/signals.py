@@ -449,6 +449,21 @@ async def _scan_one_underlying(underlying: str) -> List[TradingSignal]:
         return []
     logger.info(f"Found {len(markets)} active {underlying} 5-min markets")
 
+    # Slice P5: piggyback per-underlying active-markets cache for the
+    # dashboard. T4 measured fetch_active_crypto_markets("BTC") at
+    # ~1.2s on the dashboard hot path; this write makes the same data
+    # available to the dashboard for free (the scan was paying that HTTP
+    # cost anyway). Cached for every underlying we scan, even though
+    # only BTC is currently consumed — populating ETH/SOL/XRP entries
+    # is cost-free and avoids special-casing the writer for one reader's
+    # current scope. Failures are non-fatal: a missing cache entry just
+    # makes the dashboard fall back to its inline path.
+    try:
+        from backend.core.dashboard_cache import update_cached_active_markets
+        update_cached_active_markets(underlying, markets)
+    except Exception as e:
+        logger.warning(f"[active-markets cache] write failed for {underlying} (non-fatal): {e}")
+
     # Slice P4: piggyback per-underlying microstructure cache for the
     # dashboard. Cost is ~free in steady state — the kline cache (30s TTL,
     # in backend/data/crypto._kline_cache) absorbs the HTTP round-trip,

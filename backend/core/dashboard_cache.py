@@ -63,6 +63,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import settings
 from backend.data.crypto import CryptoMicrostructure
+from backend.data.crypto_markets import CryptoUpDownMarket
 from backend.models.database import Signal, Trade
 
 logger = logging.getLogger("trading_bot")
@@ -271,3 +272,63 @@ def update_cached_micro(
     new_cache = dict(_micro_cache)  # snapshot the existing entries
     new_cache[underlying.upper()] = (micro, ts)
     _micro_cache = new_cache  # atomic single-name rebind
+
+
+# ---------------------------------------------------------------------
+# Slice P5 (2026-04-26): per-underlying active-markets cache.
+#
+# T4 measured /api/dashboard's call to fetch_active_crypto_markets("BTC")
+# at ~1217 ms — 90.1% of dashboard latency, dominating everything else
+# by an order of magnitude. T5 confirmed it's real Polymarket gamma-api
+# HTTP latency, not a measurement artifact. The list of active 5-minute
+# markets changes slowly (Polymarket creates new windows roughly every
+# 5 minutes), so the dashboard tolerates ~60 s staleness easily.
+#
+# Same architecture as P4: per-underlying dict, whole-dict-swap for
+# atomicity, single-writer (scan) / multi-reader (dashboard), no locks.
+# Scope: the scan populates the cache for every underlying it processes
+# (BTC/ETH/SOL/XRP). The dashboard currently only reads BTC; ETH/SOL/XRP
+# entries cost nothing to populate and future-proof the cache for any
+# follow-up slice that adds a per-asset windows panel.
+# ---------------------------------------------------------------------
+_active_markets_cache: Dict[str, Tuple[List[CryptoUpDownMarket], datetime]] = {}
+
+
+def get_cached_active_markets(
+    underlying: str,
+) -> Optional[Tuple[List[CryptoUpDownMarket], datetime]]:
+    """Return the latest cached (markets, timestamp) for the given
+    underlying, or None if the scan hasn't populated this underlying yet
+    (e.g., bot just restarted before scan_and_trade_job's first cycle).
+
+    Caller handles None via inline fallback — do NOT update the cache
+    from the fallback path (single-writer invariant; only the scan
+    writes)."""
+    snapshot = _active_markets_cache  # atomic single-name read
+    return snapshot.get(underlying.upper())
+
+
+def update_cached_active_markets(
+    underlying: str,
+    markets: List[CryptoUpDownMarket],
+    timestamp: Optional[datetime] = None,
+) -> None:
+    """Atomically update the per-underlying active-markets cache. Same
+    whole-dict-swap pattern as update_cached_micro: build a brand-new
+    dict containing all existing entries plus the new one, then rebind
+    the module-level name in a single GIL-atomic step.
+
+    Markets are stored as a defensive shallow copy (list(markets)) so
+    a later in-place mutation by the writer cannot affect cached
+    readers. The CryptoUpDownMarket dataclasses themselves are
+    intentionally treated as immutable by convention — we don't deep-
+    copy them because they're produced fresh from each gamma-api
+    response and never mutated downstream.
+
+    Single-writer pattern — only call from scheduler / scan code paths,
+    never from request handlers."""
+    global _active_markets_cache
+    ts = timestamp if timestamp is not None else datetime.now(timezone.utc)
+    new_cache = dict(_active_markets_cache)
+    new_cache[underlying.upper()] = (list(markets), ts)
+    _active_markets_cache = new_cache

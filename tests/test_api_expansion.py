@@ -775,6 +775,106 @@ class TestDashboardServesMicroCache(unittest.TestCase):
         self.assertEqual(dc_mod._micro_cache, {})
 
 
+class TestDashboardServesActiveMarketsCache(unittest.TestCase):
+    """Slice P5: /api/dashboard's BTC `windows` field must read from the
+    active-markets cache populated by scan_for_signals._scan_one_underlying,
+    NOT call fetch_active_crypto_markets on every request. Mirrors the
+    structure of P2/P3/P4 dashboard-cache integration tests."""
+
+    def setUp(self):
+        self.client, self.SessionLocal, self._reset = _build_test_app_with_db()
+        _seed_bot_state(self.SessionLocal)
+        # Reset all dashboard-related caches so each test starts clean.
+        import backend.core.signals as signals_mod
+        import backend.core.dashboard_cache as dc_mod
+        signals_mod._scan_cache = None
+        dc_mod._micro_cache = {}
+        dc_mod._dashboard_cache = None
+        dc_mod._active_markets_cache = {}
+
+    def tearDown(self):
+        self._reset()
+        import backend.core.signals as signals_mod
+        import backend.core.dashboard_cache as dc_mod
+        signals_mod._scan_cache = None
+        dc_mod._micro_cache = {}
+        dc_mod._dashboard_cache = None
+        dc_mod._active_markets_cache = {}
+
+    def _sample_market(self, market_id: str) -> "object":
+        from backend.data.crypto_markets import CryptoUpDownMarket
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        # Timezone-AWARE datetimes — the is_active/is_upcoming/time_until_end
+        # properties compare against datetime.now(timezone.utc), so naive
+        # timestamps (datetime.utcnow()) raise TypeError mid-build and the
+        # dashboard's outer try/except silently empties the windows list.
+        now = _dt.now(_tz.utc)
+        return CryptoUpDownMarket(
+            slug=f"btc-updown-5m-{market_id}",
+            market_id=market_id,
+            up_price=0.5, down_price=0.5,
+            window_start=now, window_end=now + _td(minutes=5),
+            volume=100.0, volume_24h=500.0, closed=False,
+        )
+
+    @patch("backend.api.main.compute_crypto_microstructure",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.scan_for_signals",
+           new_callable=AsyncMock)
+    @patch("backend.api.main.fetch_active_crypto_markets")
+    def test_dashboard_serves_cached_markets_without_calling_fetch(
+        self, mock_fetch, mock_scan, *_other_mocks,
+    ):
+        """When the BTC active-markets cache is populated, /api/dashboard
+        must NOT call fetch_active_crypto_markets. Cached marker market
+        IDs must appear in the response.windows payload."""
+        from backend.core.dashboard_cache import update_cached_active_markets
+        marker_markets = [
+            self._sample_market("CACHED-WINDOW-A"),
+            self._sample_market("CACHED-WINDOW-B"),
+        ]
+        update_cached_active_markets("BTC", marker_markets)
+        mock_scan.return_value = []
+
+        r = self.client.get("/api/dashboard")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        windows = body.get("windows") or []
+        market_ids = sorted([w["market_id"] for w in windows])
+        self.assertEqual(market_ids, ["CACHED-WINDOW-A", "CACHED-WINDOW-B"])
+
+        # Load-bearing assertion: the slow path was NOT executed.
+        mock_fetch.assert_not_called()
+
+    @patch("backend.api.main.compute_crypto_microstructure",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.scan_for_signals",
+           new_callable=AsyncMock)
+    @patch("backend.api.main.fetch_active_crypto_markets")
+    def test_dashboard_falls_back_to_inline_fetch_on_cache_miss(
+        self, mock_fetch, mock_scan, *_other_mocks,
+    ):
+        """When the cache is empty (e.g., bot just restarted before
+        scan_for_signals fired), /api/dashboard must call
+        fetch_active_crypto_markets ONCE as a fallback. The fallback must
+        NOT update the cache — single-writer invariant; only the scan
+        writes."""
+        # Cache empty per setUp.
+        mock_scan.return_value = []
+        mock_fetch.return_value = [self._sample_market("FALLBACK-1")]
+
+        r = self.client.get("/api/dashboard")
+        self.assertEqual(r.status_code, 200)
+        # Fallback fired exactly once.
+        self.assertEqual(mock_fetch.call_count, 1)
+
+        # Critical: cache STILL empty after the dashboard fallback ran.
+        # A subsequent dashboard request would hit the same fallback
+        # again until the scan populates the cache.
+        import backend.core.dashboard_cache as dc_mod
+        self.assertEqual(dc_mod._active_markets_cache, {})
+
+
 class TestKalshiSettlementParser(unittest.TestCase):
     def test_parses_yymmmdd_from_ticker(self):
         from backend.api.main import _parse_kalshi_expected_settlement

@@ -19,6 +19,10 @@ from backend.models.database import (
     Signal, Trade, BotState, ScanLog
 )
 from backend.core.signals import scan_for_signals, get_cached_scan, TradingSignal
+from backend.core.dashboard_cache import (
+    build_dashboard_cache_payload,
+    get_cached_dashboard_data,
+)
 from backend.data.crypto_markets import fetch_active_crypto_markets, CryptoUpDownMarket
 from backend.data.crypto import fetch_crypto_price, compute_crypto_microstructure
 
@@ -187,13 +191,11 @@ class CalibrationBucket(BaseModel):
     count: int
 
 
-class CalibrationSummary(BaseModel):
-    total_signals: int
-    total_with_outcome: int
-    accuracy: float
-    avg_predicted_edge: float
-    avg_actual_edge: float
-    brier_score: float
+# CalibrationSummary moved to backend.core.dashboard_cache in slice P3 to
+# break a circular import (dashboard_cache.py needs the type to populate
+# the cache; main.py needs the type for response serialization). Re-imported
+# here so existing references in this module keep working unchanged.
+from backend.core.dashboard_cache import CalibrationSummary  # noqa: E402, F401
 
 
 class MultiMicrostructure(BaseModel):
@@ -977,51 +979,11 @@ async def _build_multi_microstructure() -> MultiMicrostructure:
     return MultiMicrostructure(microstructures=micro_map, prices=price_map)
 
 
-def _compute_calibration_summary(db: Session) -> Optional[CalibrationSummary]:
-    """Compute calibration summary from settled signals."""
-    total_signals = db.query(Signal).count()
-    settled_signals = db.query(Signal).filter(Signal.outcome_correct.isnot(None)).all()
-
-    if not settled_signals:
-        if total_signals == 0:
-            return None
-        return CalibrationSummary(
-            total_signals=total_signals,
-            total_with_outcome=0,
-            accuracy=0.0,
-            avg_predicted_edge=0.0,
-            avg_actual_edge=0.0,
-            brier_score=0.0,
-        )
-
-    total_with_outcome = len(settled_signals)
-    correct = sum(1 for s in settled_signals if s.outcome_correct)
-    accuracy = correct / total_with_outcome if total_with_outcome > 0 else 0.0
-
-    avg_predicted_edge = sum(abs(s.edge) for s in settled_signals) / total_with_outcome
-    # Actual edge: for correct predictions, edge was real; for incorrect, edge was negative
-    avg_actual_edge = sum(
-        abs(s.edge) if s.outcome_correct else -abs(s.edge)
-        for s in settled_signals
-    ) / total_with_outcome
-
-    # Brier score: mean squared error of probability forecasts
-    # For each signal: (predicted_prob - actual_outcome)^2
-    brier_sum = 0.0
-    for s in settled_signals:
-        # Model probability is for UP; actual is 1.0 if UP won, 0.0 if DOWN won
-        actual = s.settlement_value if s.settlement_value is not None else 0.5
-        brier_sum += (s.model_probability - actual) ** 2
-    brier_score = brier_sum / total_with_outcome
-
-    return CalibrationSummary(
-        total_signals=total_signals,
-        total_with_outcome=total_with_outcome,
-        accuracy=accuracy,
-        avg_predicted_edge=avg_predicted_edge,
-        avg_actual_edge=avg_actual_edge,
-        brier_score=brier_score,
-    )
+# _compute_calibration_summary moved to backend.core.dashboard_cache in
+# slice P3 alongside CalibrationSummary itself. Re-imported here so the
+# /api/calibration endpoint (which still calls it directly for its own
+# response shape) keeps working without code changes.
+from backend.core.dashboard_cache import _compute_calibration_summary  # noqa: E402, F401
 
 
 @app.get("/api/calibration")
@@ -1299,21 +1261,23 @@ async def get_dashboard(db: Session = Depends(get_db)):
     )
     recent_trades = [_trade_to_response(t) for t in trades]
 
-    # Equity curve
-    equity_trades = db.query(Trade).filter(Trade.settled == True).order_by(Trade.timestamp).all()
-    equity_curve = []
-    cumulative_pnl = 0
-    for trade in equity_trades:
-        if trade.pnl is not None:
-            cumulative_pnl += trade.pnl
-            equity_curve.append({
-                "timestamp": trade.timestamp.isoformat(),
-                "pnl": cumulative_pnl,
-                "bankroll": settings.INITIAL_BANKROLL + cumulative_pnl
-            })
-
-    # Calibration summary
-    calibration = _compute_calibration_summary(db)
+    # Slice P3: equity curve + calibration both come from the in-process
+    # cache populated by scheduler.settlement_job. Pre-P3, both queries
+    # ran on every /api/dashboard request — equity loaded all 750+
+    # settled trades, calibration loaded all settled signals and
+    # aggregated. Together they were ~600ms of every dashboard poll
+    # (Audit Findings #3 and #4). Cache update is single-writer
+    # (scheduler), multi-reader (this endpoint); see dashboard_cache.py
+    # for the concurrency model. On cache miss (first dashboard request
+    # after a fresh restart, before settlement_job has fired) we fall
+    # back to building once and log it; we do NOT update the cache from
+    # the dashboard, that would violate the single-writer invariant.
+    cached_payload, _cached_ts = get_cached_dashboard_data()
+    if cached_payload is None:
+        logger.info("[dashboard] equity/calibration cache miss — building inline (one-time)")
+        cached_payload = build_dashboard_cache_payload(db)
+    equity_curve = cached_payload["equity_curve"]
+    calibration = cached_payload["calibration"]
 
     # Slice D2: multi-asset + multi-strategy visibility. All four blocks
     # degrade to sensible empty values on failure so the dashboard never

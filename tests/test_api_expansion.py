@@ -563,6 +563,108 @@ class TestDashboardServesScanCache(unittest.TestCase):
         self.assertEqual(mock_scan.call_count, 1)
 
 
+class TestDashboardServesEquityCalibrationCache(unittest.TestCase):
+    """Slice P3: /api/dashboard must read equity_curve + calibration from
+    the cache populated by scheduler.settlement_job, NOT run the underlying
+    queries on every request. Mirrors P2's TestDashboardServesScanCache
+    exactly. The load-bearing assertion in each test is that
+    build_dashboard_cache_payload was NOT called (cache hit) or WAS called
+    exactly once (cache miss, dashboard fallback)."""
+
+    def setUp(self):
+        self.client, self.SessionLocal, self._reset = _build_test_app_with_db()
+        _seed_bot_state(self.SessionLocal)
+        # Reset cache to a known state for each test.
+        import backend.core.dashboard_cache as dc_mod
+        dc_mod._dashboard_cache = None
+
+    def tearDown(self):
+        self._reset()
+        import backend.core.dashboard_cache as dc_mod
+        dc_mod._dashboard_cache = None
+
+    @patch("backend.api.main.compute_crypto_microstructure",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.fetch_crypto_price",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.fetch_active_crypto_markets",
+           new=AsyncMock(return_value=[]))
+    @patch("backend.api.main.scan_for_signals",
+           new_callable=AsyncMock)
+    @patch("backend.api.main.build_dashboard_cache_payload")
+    def test_dashboard_serves_cached_payload_without_running_queries(
+        self, mock_builder, mock_scan, *_other_mocks,
+    ):
+        """When the cache is populated, /api/dashboard must NOT call
+        build_dashboard_cache_payload (which runs the equity-curve query
+        AND the calibration computation). Cached marker data must appear
+        in the response."""
+        from backend.core.dashboard_cache import (
+            CalibrationSummary, update_cached_dashboard_data,
+        )
+        marker_curve = [{
+            "timestamp": "2026-04-25T21:00:00",
+            "pnl": 42.0,
+            "bankroll": 242.0,
+        }]
+        marker_calibration = CalibrationSummary(
+            total_signals=1, total_with_outcome=1, accuracy=1.0,
+            avg_predicted_edge=0.10, avg_actual_edge=0.10, brier_score=0.16,
+        )
+        update_cached_dashboard_data({
+            "equity_curve": marker_curve,
+            "calibration": marker_calibration,
+        })
+        mock_scan.return_value = []  # avoid unrelated cache miss noise
+
+        r = self.client.get("/api/dashboard")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        # Cached marker survived round-trip through Pydantic serialization.
+        self.assertEqual(len(body["equity_curve"]), 1)
+        self.assertAlmostEqual(body["equity_curve"][0]["pnl"], 42.0)
+        self.assertAlmostEqual(body["equity_curve"][0]["bankroll"], 242.0)
+        self.assertIsNotNone(body["calibration"])
+        self.assertEqual(body["calibration"]["total_signals"], 1)
+        self.assertAlmostEqual(body["calibration"]["brier_score"], 0.16)
+        # Load-bearing: the slow path was NOT executed.
+        mock_builder.assert_not_called()
+
+    @patch("backend.api.main.compute_crypto_microstructure",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.fetch_crypto_price",
+           new=AsyncMock(return_value=None))
+    @patch("backend.api.main.fetch_active_crypto_markets",
+           new=AsyncMock(return_value=[]))
+    @patch("backend.api.main.scan_for_signals",
+           new_callable=AsyncMock)
+    @patch("backend.api.main.build_dashboard_cache_payload")
+    def test_dashboard_falls_back_to_inline_build_on_cache_miss(
+        self, mock_builder, mock_scan, *_other_mocks,
+    ):
+        """When the cache has never been populated (e.g., bot just
+        restarted, settlement_job hasn't fired), /api/dashboard must call
+        build_dashboard_cache_payload once as fallback so the user sees
+        something. Single call only — the fallback must NOT update the
+        cache (would violate the single-writer invariant)."""
+        # Cache is None per setUp.
+        mock_builder.return_value = {"equity_curve": [], "calibration": None}
+        mock_scan.return_value = []
+
+        r = self.client.get("/api/dashboard")
+        self.assertEqual(r.status_code, 200)
+        # The fallback ran exactly once.
+        self.assertEqual(mock_builder.call_count, 1)
+
+        # Critical: cache is STILL empty after the dashboard fallback —
+        # only the scheduler is allowed to write. A subsequent dashboard
+        # request would hit the same fallback again until settlement_job
+        # populates the cache.
+        from backend.core.dashboard_cache import _dashboard_cache
+        import backend.core.dashboard_cache as dc_mod
+        self.assertIsNone(dc_mod._dashboard_cache)
+
+
 class TestKalshiSettlementParser(unittest.TestCase):
     def test_parses_yymmmdd_from_ticker(self):
         from backend.api.main import _parse_kalshi_expected_settlement

@@ -449,6 +449,7 @@ async def settlement_job():
 
     try:
         from backend.core.settlement import settle_pending_trades, update_bot_state_with_settlements
+        from backend.core.dashboard_cache import refresh_dashboard_cache
 
         db = SessionLocal()
         try:
@@ -456,6 +457,12 @@ async def settlement_job():
 
             if pending_count == 0:
                 log_event("data", "No pending trades to settle")
+                # Slice P3: still refresh the dashboard cache even when
+                # nothing settled this cycle. Keeps the cache warm across
+                # bot restarts (it populates within one settlement_job
+                # tick of startup, ~2 min) and absorbs any out-of-band
+                # calibration updates.
+                _refresh_dashboard_cache_safe(db, refresh_dashboard_cache)
                 return
 
             log_event("data", f"Processing {pending_count} pending trades")
@@ -482,12 +489,30 @@ async def settlement_job():
             else:
                 log_event("info", "No trades ready for settlement")
 
+            # Slice P3: refresh dashboard cache after settlement work.
+            # Wrapped so a cache failure can't cascade into settlement
+            # rollback or false-error logs. The cache being stale is
+            # strictly better than the settlement loop failing.
+            _refresh_dashboard_cache_safe(db, refresh_dashboard_cache)
+
         finally:
             db.close()
 
     except Exception as e:
         log_event("error", f"Settlement error: {str(e)}")
         logger.exception("Error in settlement_job")
+
+
+def _refresh_dashboard_cache_safe(db, refresh_fn):
+    """Slice P3 helper: invoke refresh_dashboard_cache(db) and absorb
+    any exception. The dashboard cache is best-effort — if it fails,
+    /api/dashboard falls back to its inline-build path on the next
+    request. No reason to let a cache failure surface as a settlement
+    error in the logs."""
+    try:
+        refresh_fn(db)
+    except Exception as e:
+        logger.warning(f"[dashboard cache] refresh failed (non-fatal): {e}")
 
 
 async def heartbeat_job():

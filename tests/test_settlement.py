@@ -491,6 +491,71 @@ class TestFetchPolymarketResolution(unittest.TestCase):
         self.assertTrue(is_resolved)
         self.assertEqual(value, 1.0)
 
+    def test_direct_url_422_falls_back_to_event_search(self):
+        # Slice B2 fix: Polymarket's gamma-api returns HTTP 422 (NOT 404)
+        # for invalid market IDs — verified by curl, response body is
+        # {"type":"validation error","error":"id is invalid"}. Before B2,
+        # the status_code check was 404-only and 422 silently dropped
+        # into (False, None), leaving trades stuck pending forever. This
+        # test pins the new contract: 422 routes to the search-fallback
+        # path, exactly the same way 404 does. Mirror of the 404 test
+        # above with status code swapped.
+        def handler(req):
+            return httpx.Response(
+                422,
+                json={"type": "validation error", "error": "id is invalid"},
+            )
+
+        async def fake_search(market_id):
+            self.assertEqual(market_id, "invalid-id")
+            return True, 0.0
+
+        async def go():
+            async with _mock_client(handler) as client:
+                with mock.patch.object(
+                    settlement_module, "_search_market_in_events",
+                    side_effect=fake_search,
+                ):
+                    return await fetch_polymarket_resolution(
+                        "invalid-id", http_client=client,
+                    )
+
+        is_resolved, value = _run(go())
+        self.assertTrue(is_resolved)
+        self.assertEqual(value, 0.0)
+
+    def test_http_400_does_not_trigger_fallback(self):
+        # Defensive: only 404 and 422 trigger the search-fallback. Other
+        # 4xx codes (e.g., 400 Bad Request, 401 Unauthorized, 403 Forbidden)
+        # bubble through the response.raise_for_status() and the broad
+        # except, returning (False, None) so the settlement loop retries
+        # on the next cycle. Pinning this to prevent a future "widen to
+        # any 4xx" change from being made without explicit rationale.
+        fallback_called = {"value": False}
+
+        def handler(req):
+            return httpx.Response(400, json={"error": "bad request"})
+
+        async def fake_search(market_id):
+            fallback_called["value"] = True
+            return True, 1.0  # would be a misleading success if called
+
+        async def go():
+            async with _mock_client(handler) as client:
+                with mock.patch.object(
+                    settlement_module, "_search_market_in_events",
+                    side_effect=fake_search,
+                ):
+                    return await fetch_polymarket_resolution(
+                        "any", http_client=client,
+                    )
+
+        is_resolved, value = _run(go())
+        self.assertFalse(is_resolved)
+        self.assertIsNone(value)
+        self.assertFalse(fallback_called["value"],
+                         "400 should not trigger search-fallback")
+
     def test_http_500_returns_not_resolved(self):
         def handler(req):
             return httpx.Response(500, text="server error")

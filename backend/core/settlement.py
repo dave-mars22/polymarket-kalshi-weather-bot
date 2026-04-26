@@ -54,7 +54,16 @@ async def fetch_polymarket_resolution(
             url = f"https://gamma-api.polymarket.com/markets/{market_id}"
             response = await client.get(url)
 
-            if response.status_code == 404:
+            # Slice B2: 422 added alongside 404. Polymarket's gamma-api
+            # returns HTTP 422 ({"type":"validation error","error":"id is
+            # invalid"}) when the market_id doesn't match its expected
+            # format — verified by curl. The original 404-only check
+            # silently dropped these into (False, None), leaving trades
+            # stuck pending forever. Same silent-failure shape as the B1
+            # Kalshi credential-gate bug. Both 404 and 422 mean "this
+            # market_id is unknown via the direct path; fall back to the
+            # event-search path" — semantically equivalent for our purposes.
+            if response.status_code in (404, 422):
                 return await _search_market_in_events(market_id)
 
             response.raise_for_status()

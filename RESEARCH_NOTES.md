@@ -1,6 +1,6 @@
 # RESEARCH_NOTES.md
 
-*Project research memory. Companion to README.md (what the code does), ARCHITECTURE.md (historical, pre-rebuild), and STRATEGY3_SCOPE.md (cross-platform arbitrage scoping doc). This document captures what we have **learned**, what we have **decided**, and what we plan to **investigate**. It is updated as the project evolves — every diagnostic, parameter change, and checkpoint adds to it.*
+*Project research memory. Companion to README.md (what the code does), ARCHITECTURE.md (historical, pre-rebuild), STRATEGY3_SCOPE.md (cross-platform arbitrage scoping doc), and BACKTESTER_SCOPE.md (historical backtester scoping doc). This document captures what we have **learned**, what we have **decided**, and what we plan to **investigate**. It is updated as the project evolves — every diagnostic, parameter change, and checkpoint adds to it.*
 
 *Last meaningful update: 2026-04-25 (slice N5 — capture E1 GBM-derivation findings + add document update protocol as Section 14).*
 

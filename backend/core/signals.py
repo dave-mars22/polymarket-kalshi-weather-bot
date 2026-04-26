@@ -449,6 +449,22 @@ async def _scan_one_underlying(underlying: str) -> List[TradingSignal]:
         return []
     logger.info(f"Found {len(markets)} active {underlying} 5-min markets")
 
+    # Slice P4: piggyback per-underlying microstructure cache for the
+    # dashboard. Cost is ~free in steady state — the kline cache (30s TTL,
+    # in backend/data/crypto._kline_cache) absorbs the HTTP round-trip,
+    # and the indicator math is sub-millisecond. Doing this BEFORE the
+    # per-market loop guarantees the cache populates even if no markets
+    # are returned for this underlying. Failures are non-fatal: a missing
+    # cache entry just makes the dashboard fall back to its inline path
+    # for that one underlying.
+    try:
+        from backend.core.dashboard_cache import update_cached_micro
+        warm_micro = await compute_crypto_microstructure(underlying)
+        if warm_micro is not None:
+            update_cached_micro(underlying, warm_micro)
+    except Exception as e:
+        logger.warning(f"[micro cache] warm failed for {underlying} (non-fatal): {e}")
+
     out: List[TradingSignal] = []
     for market in markets:
         try:

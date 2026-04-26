@@ -62,6 +62,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from backend.config import settings
+from backend.data.crypto import CryptoMicrostructure
 from backend.models.database import Signal, Trade
 
 logger = logging.getLogger("trading_bot")
@@ -214,3 +215,59 @@ def refresh_dashboard_cache(db: Session) -> None:
     cache is left at its prior contents (stale but valid)."""
     payload = build_dashboard_cache_payload(db)
     update_cached_dashboard_data(payload)
+
+
+# ---------------------------------------------------------------------
+# Slice P4: per-underlying microstructure cache. Distinct from the
+# (payload, ts) cache above because the consumer pattern is different —
+# multi-microstructure is keyed by underlying, with each underlying
+# updated independently as the scan job processes it.
+#
+# Concurrency model: WHOLE-DICT SWAP. The module-level _micro_cache name
+# is rebound to a brand-new dict on every update; readers either see the
+# old dict or the new dict, never a partial state. This is GIL-safe
+# (single-name binding is atomic) at the cost of building a new 4-key
+# dict on every update — negligible.
+#
+# Why not in-place dict mutation? `_micro_cache[u] = (...)` in CPython
+# is atomic at the bytecode level for individual key assignment, but
+# whole-dict swap is more defensively correct: a reader iterating the
+# dict (e.g., to enumerate underlyings) under in-place mutation could
+# observe a transient half-updated state on some Python implementation
+# or with some future change. Whole-dict swap is fully atomic regardless.
+#
+# Single-writer: scan_for_signals._scan_one_underlying is the only path
+# that calls update_cached_micro. Multi-reader: any /api/dashboard or
+# /api/microstructure request can call get_cached_micro.
+# ---------------------------------------------------------------------
+_micro_cache: Dict[str, Tuple[CryptoMicrostructure, datetime]] = {}
+
+
+def get_cached_micro(underlying: str) -> Optional[Tuple[CryptoMicrostructure, datetime]]:
+    """Return the latest cached (micro, timestamp) for the given underlying,
+    or None if no scan has populated this underlying yet (e.g., bot just
+    restarted and scan_and_trade_job hasn't fired its first cycle).
+
+    Caller is expected to handle the None case via inline fallback —
+    do NOT update the cache from the fallback path (single-writer
+    invariant; only scan_for_signals writes)."""
+    snapshot = _micro_cache  # atomic single-name read
+    return snapshot.get(underlying.upper())
+
+
+def update_cached_micro(
+    underlying: str,
+    micro: CryptoMicrostructure,
+    timestamp: Optional[datetime] = None,
+) -> None:
+    """Atomically update the per-underlying micro cache. Builds a brand-new
+    dict containing all existing entries plus the new one, then rebinds
+    the module-level name to the new dict in a single GIL-atomic step.
+
+    Single-writer pattern — only call from scheduler / scan code paths,
+    never from request handlers."""
+    global _micro_cache
+    ts = timestamp if timestamp is not None else datetime.now(timezone.utc)
+    new_cache = dict(_micro_cache)  # snapshot the existing entries
+    new_cache[underlying.upper()] = (micro, ts)
+    _micro_cache = new_cache  # atomic single-name rebind

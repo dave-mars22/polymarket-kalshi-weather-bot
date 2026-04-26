@@ -665,6 +665,116 @@ class TestDashboardServesEquityCalibrationCache(unittest.TestCase):
         self.assertIsNone(dc_mod._dashboard_cache)
 
 
+class TestDashboardServesMicroCache(unittest.TestCase):
+    """Slice P4: /api/dashboard must read multi-microstructure from the
+    per-underlying cache populated by scan_for_signals._scan_one_underlying,
+    NOT call compute_crypto_microstructure for each underlying on every
+    request. Mirrors the structure of P2's TestDashboardServesScanCache
+    and P3's TestDashboardServesEquityCalibrationCache exactly."""
+
+    def setUp(self):
+        self.client, self.SessionLocal, self._reset = _build_test_app_with_db()
+        _seed_bot_state(self.SessionLocal)
+        # Reset both the scan-results cache and the per-underlying micro
+        # cache so tests start from a known state.
+        import backend.core.signals as signals_mod
+        import backend.core.dashboard_cache as dc_mod
+        signals_mod._scan_cache = None
+        dc_mod._micro_cache = {}
+        dc_mod._dashboard_cache = None
+
+    def tearDown(self):
+        self._reset()
+        import backend.core.signals as signals_mod
+        import backend.core.dashboard_cache as dc_mod
+        signals_mod._scan_cache = None
+        dc_mod._micro_cache = {}
+        dc_mod._dashboard_cache = None
+
+    def _populate_all_underlying_caches(self):
+        """Seed the P4 micro cache with one entry per configured underlying
+        so the dashboard can serve every underlying from cache."""
+        from backend.core.dashboard_cache import update_cached_micro
+        from backend.data.crypto import CryptoMicrostructure
+        for u in ["BTC", "ETH", "SOL", "XRP"]:
+            micro = CryptoMicrostructure(
+                rsi=55.0, momentum_1m=0.1, momentum_5m=0.2, momentum_15m=0.3,
+                vwap_deviation=0.01, sma_crossover=0.02, volatility=0.5,
+                price=1000.0 + ord(u[0]),  # distinctive per-underlying
+                source="coinbase-cached",
+            )
+            update_cached_micro(u, micro)
+
+    @patch("backend.api.main.fetch_active_crypto_markets",
+           new=AsyncMock(return_value=[]))
+    @patch("backend.api.main.scan_for_signals",
+           new_callable=AsyncMock)
+    @patch("backend.api.main.compute_crypto_microstructure")
+    def test_dashboard_serves_cached_micros_without_calling_compute(
+        self, mock_compute, mock_scan, *_other_mocks,
+    ):
+        """When all 4 underlying caches are populated, /api/dashboard must
+        NOT call compute_crypto_microstructure for any underlying. Cached
+        marker source ('coinbase-cached') must appear in the response."""
+        self._populate_all_underlying_caches()
+        mock_scan.return_value = []
+
+        r = self.client.get("/api/dashboard")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+
+        multi = body.get("multi_microstructure")
+        self.assertIsNotNone(multi)
+        micros = multi.get("microstructures") or {}
+        # All 4 underlyings present, all served from cache (distinctive
+        # source string proves it wasn't a live recompute).
+        self.assertEqual(set(micros.keys()), {"BTC", "ETH", "SOL", "XRP"})
+        for u in ("BTC", "ETH", "SOL", "XRP"):
+            self.assertEqual(micros[u]["source"], "coinbase-cached")
+
+        # Load-bearing assertion: the slow path was NOT executed.
+        mock_compute.assert_not_called()
+
+    @patch("backend.api.main.fetch_active_crypto_markets",
+           new=AsyncMock(return_value=[]))
+    @patch("backend.api.main.scan_for_signals",
+           new_callable=AsyncMock)
+    @patch("backend.api.main.compute_crypto_microstructure")
+    def test_dashboard_falls_back_to_inline_compute_on_micro_cache_miss(
+        self, mock_compute, mock_scan, *_other_mocks,
+    ):
+        """When the micro cache is empty (e.g., bot just restarted before
+        scan has fired), /api/dashboard must call compute_crypto_microstructure
+        once per underlying as a fallback. The fallback must NOT update the
+        cache — single-writer invariant."""
+        from backend.data.crypto import CryptoMicrostructure
+        mock_scan.return_value = []
+
+        # Mock returns a distinctive marker so we can prove the fallback
+        # path produced the response, not some leaked cache state.
+        async def fake_compute(underlying):
+            return CryptoMicrostructure(
+                rsi=42.0, momentum_1m=0.0, momentum_5m=0.0, momentum_15m=0.0,
+                vwap_deviation=0.0, sma_crossover=0.0, volatility=0.0,
+                price=999.0, source="inline-fallback",
+            )
+        mock_compute.side_effect = fake_compute
+
+        r = self.client.get("/api/dashboard")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+
+        # Fallback fired — each configured underlying got at least one
+        # compute call (the BTC singular path also calls it, so call_count
+        # is >= number of underlyings, not strictly equal).
+        self.assertGreaterEqual(mock_compute.call_count, 4)
+
+        # Critical: fallback did NOT write to the cache. Subsequent
+        # requests would still hit the fallback until scan populates it.
+        import backend.core.dashboard_cache as dc_mod
+        self.assertEqual(dc_mod._micro_cache, {})
+
+
 class TestKalshiSettlementParser(unittest.TestCase):
     def test_parses_yymmmdd_from_ticker(self):
         from backend.api.main import _parse_kalshi_expected_settlement

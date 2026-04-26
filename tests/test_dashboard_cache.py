@@ -183,5 +183,102 @@ class TestRefreshDashboardCache(unittest.TestCase):
         self.assertEqual(payload["equity_curve"], [])
 
 
+# =============================================================================
+# Slice P4: per-underlying micro cache (separate state from the P3 single
+# (payload, ts) cache above). Tests cover the same shape: state machine,
+# round-trip, miss returns None, whole-dict-swap atomicity smoke check.
+# =============================================================================
+
+
+from backend.core.dashboard_cache import (
+    get_cached_micro,
+    update_cached_micro,
+)
+from backend.data.crypto import CryptoMicrostructure
+
+
+def _reset_micro_cache():
+    """Clear the per-underlying micro cache between tests."""
+    dc._micro_cache = {}
+
+
+class TestPerUnderlyingMicroCache(unittest.TestCase):
+    """State + accessors for the P4 per-underlying micro cache."""
+
+    def setUp(self):
+        _reset_micro_cache()
+
+    def tearDown(self):
+        _reset_micro_cache()
+
+    def _sample_micro(self, rsi: float = 55.0, price: float = 77000.0) -> CryptoMicrostructure:
+        return CryptoMicrostructure(
+            rsi=rsi, momentum_1m=0.1, momentum_5m=0.2, momentum_15m=0.3,
+            vwap_deviation=0.01, sma_crossover=0.02, volatility=0.5,
+            price=price, source="coinbase",
+        )
+
+    def test_get_returns_none_on_miss(self):
+        # Nothing in the cache yet — every underlying returns None.
+        self.assertIsNone(get_cached_micro("BTC"))
+        self.assertIsNone(get_cached_micro("ETH"))
+        self.assertIsNone(get_cached_micro("XRP"))
+
+    def test_round_trip_preserves_micro_and_timestamp(self):
+        micro = self._sample_micro(rsi=42.0, price=80000.0)
+        update_cached_micro("BTC", micro)
+        cached = get_cached_micro("BTC")
+        self.assertIsNotNone(cached)
+        got_micro, got_ts = cached
+        self.assertIs(got_micro, micro)
+        self.assertIsInstance(got_ts, datetime)
+
+    def test_underlying_lookup_is_case_insensitive(self):
+        # Cache normalizes to upper. "btc"/"BTC"/"Btc" all map to the
+        # same slot — pin this so a future caller using lowercase tickers
+        # doesn't silently miss the cache.
+        micro = self._sample_micro()
+        update_cached_micro("btc", micro)
+        self.assertIs(get_cached_micro("BTC")[0], micro)
+        self.assertIs(get_cached_micro("Btc")[0], micro)
+
+    def test_multiple_underlyings_isolated(self):
+        # Updating BTC must not affect the other underlyings' cache slots.
+        btc = self._sample_micro(price=77000.0)
+        eth = self._sample_micro(price=3500.0)
+        update_cached_micro("BTC", btc)
+        update_cached_micro("ETH", eth)
+        self.assertIs(get_cached_micro("BTC")[0], btc)
+        self.assertIs(get_cached_micro("ETH")[0], eth)
+        # SOL/XRP weren't updated — still None.
+        self.assertIsNone(get_cached_micro("SOL"))
+        self.assertIsNone(get_cached_micro("XRP"))
+
+    def test_update_overwrites_prior_entry_for_same_underlying(self):
+        m1 = self._sample_micro(rsi=30.0)
+        m2 = self._sample_micro(rsi=70.0)
+        update_cached_micro("BTC", m1)
+        update_cached_micro("BTC", m2)
+        self.assertEqual(get_cached_micro("BTC")[0].rsi, 70.0)
+
+    def test_update_uses_whole_dict_swap_atomicity(self):
+        # Smoke test the atomicity guarantee: rebinding the module-level
+        # name to a NEW dict on every update means a reader holding a
+        # snapshot of the old dict won't see the new entry. We can't
+        # truly test concurrent observation in a single thread, but we
+        # can pin that the dict identity changes on update.
+        update_cached_micro("BTC", self._sample_micro())
+        first_dict = dc._micro_cache
+        update_cached_micro("ETH", self._sample_micro())
+        second_dict = dc._micro_cache
+        # Different dict objects (atomic rebind), not in-place mutation.
+        self.assertIsNot(first_dict, second_dict)
+        # Old dict snapshot still has only BTC; new dict has both.
+        self.assertIn("BTC", first_dict)
+        self.assertNotIn("ETH", first_dict)
+        self.assertIn("BTC", second_dict)
+        self.assertIn("ETH", second_dict)
+
+
 if __name__ == "__main__":
     unittest.main()

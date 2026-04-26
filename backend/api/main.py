@@ -22,6 +22,7 @@ from backend.core.signals import scan_for_signals, get_cached_scan, TradingSigna
 from backend.core.dashboard_cache import (
     build_dashboard_cache_payload,
     get_cached_dashboard_data,
+    get_cached_micro,
 )
 from backend.data.crypto_markets import fetch_active_crypto_markets, CryptoUpDownMarket
 from backend.data.crypto import fetch_crypto_price, compute_crypto_microstructure
@@ -935,28 +936,42 @@ def _build_mc_portfolio_status(db: Session) -> McPortfolioStatus:
 
 
 async def _build_multi_microstructure() -> MultiMicrostructure:
-    """Fetch microstructure + spot price for every configured tech underlying.
+    """Read per-underlying microstructure from the cache populated by the
+    scan job. On a per-underlying cache miss (e.g., immediately post
+    bot restart, before scan_and_trade_job has fired its first cycle)
+    fall back to one inline compute_crypto_microstructure call for that
+    underlying. The fallback path does NOT update the cache —
+    single-writer invariant; only the scan writes.
 
-    Runs all underlyings concurrently via asyncio.gather. Per-underlying
-    failures are swallowed so one dead exchange adapter doesn't null the
-    whole response — missing symbols are simply absent from the dicts.
+    Slice P4 changes from the pre-P4 version:
+      - Reads from get_cached_micro instead of always calling
+        compute_crypto_microstructure live (~270ms saved when cache hot).
+      - Drops the parallel fetch_crypto_price calls entirely. The
+        prices field now uses micro.price unconditionally — same data
+        source (Coinbase 1m close), and eliminates the rate-limit-induced
+        CoinGecko 429s the pre-P4 code tolerated silently.
     """
     underlyings = _configured_tech_underlyings()
     if not underlyings:
         return MultiMicrostructure()
 
-    micro_tasks = [compute_crypto_microstructure(u) for u in underlyings]
-    price_tasks = [fetch_crypto_price(u) for u in underlyings]
-    micros, prices = await asyncio.gather(
-        asyncio.gather(*micro_tasks, return_exceptions=True),
-        asyncio.gather(*price_tasks, return_exceptions=True),
-    )
-
     micro_map: Dict[str, MicrostructureResponse] = {}
     price_map: Dict[str, float] = {}
-    for u, micro in zip(underlyings, micros):
-        if isinstance(micro, Exception) or micro is None:
-            continue
+
+    for u in underlyings:
+        cached = get_cached_micro(u)
+        if cached is not None:
+            micro, _ts = cached
+        else:
+            logger.info(f"[dashboard] micro cache miss for {u} — building inline (one-time)")
+            try:
+                micro = await compute_crypto_microstructure(u)
+            except Exception as e:
+                logger.warning(f"[dashboard] inline micro fallback failed for {u}: {e}")
+                continue
+            if micro is None:
+                continue
+
         micro_map[u] = MicrostructureResponse(
             rsi=micro.rsi,
             momentum_1m=micro.momentum_1m,
@@ -968,13 +983,7 @@ async def _build_multi_microstructure() -> MultiMicrostructure:
             price=micro.price,
             source=micro.source,
         )
-        # Micro already has a current_price; use it as the default spot so a
-        # CoinGecko outage on one symbol still yields a usable price.
         price_map[u] = float(micro.price)
-    for u, price in zip(underlyings, prices):
-        if isinstance(price, Exception) or price is None:
-            continue
-        price_map[u] = float(price.current_price)
 
     return MultiMicrostructure(microstructures=micro_map, prices=price_map)
 
@@ -1129,11 +1138,22 @@ async def get_dashboard(db: Session = Depends(get_db)):
     """Get all dashboard data in one call."""
     stats = await get_stats(db)
 
-    # Fetch BTC price from microstructure first, fallback to CoinGecko
+    # Slice P4: BTC microstructure + price from the per-underlying cache,
+    # populated by scan_and_trade_job every 60s. On cache miss (e.g.,
+    # first dashboard request post-restart) fall back to one inline
+    # compute_crypto_microstructure call. The pre-P4 fetch_crypto_price
+    # fallback is dropped — micro.price is the same data source (Coinbase
+    # 1m close) and the rate-limited CoinGecko fallback was the source
+    # of the 429s in the logs.
     btc_price_data = None
     micro_data = None
     try:
-        micro = await compute_crypto_microstructure("BTC")
+        cached_btc = get_cached_micro("BTC")
+        if cached_btc is not None:
+            micro, _ts = cached_btc
+        else:
+            logger.info("[dashboard] btc micro cache miss — building inline (one-time)")
+            micro = await compute_crypto_microstructure("BTC")
         if micro:
             micro_data = MicrostructureResponse(
                 rsi=micro.rsi,
@@ -1156,20 +1176,11 @@ async def get_dashboard(db: Session = Depends(get_db)):
             )
     except Exception:
         pass
-    if not btc_price_data:
-        try:
-            btc = await fetch_crypto_price("BTC")
-            if btc:
-                btc_price_data = BtcPriceResponse(
-                    price=btc.current_price,
-                    change_24h=btc.change_24h,
-                    change_7d=btc.change_7d,
-                    market_cap=btc.market_cap,
-                    volume_24h=btc.volume_24h,
-                    last_updated=btc.last_updated
-                )
-        except Exception:
-            pass
+    # Pre-P4 there was a fetch_crypto_price("BTC") fallback here. Removed
+    # in P4 because (a) the cache-or-inline path above almost never both
+    # fail, and (b) the fallback was the rate-limited CoinGecko call we
+    # were trying to escape. If both cache and inline fail, btc_price_data
+    # stays None and the dashboard renders without it (graceful degrade).
 
     # Fetch windows
     windows = []

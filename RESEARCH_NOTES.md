@@ -2,7 +2,7 @@
 
 *Project research memory. Companion to README.md (what the code does), ARCHITECTURE.md (historical, pre-rebuild), STRATEGY3_SCOPE.md (cross-platform arbitrage scoping doc), and BACKTESTER_SCOPE.md (historical backtester scoping doc). This document captures what we have **learned**, what we have **decided**, and what we plan to **investigate**. It is updated as the project evolves — every diagnostic, parameter change, and checkpoint adds to it.*
 
-*Last meaningful update: 2026-04-25 (slice N5 — capture E1 GBM-derivation findings + add document update protocol as Section 14).*
+*Last meaningful update: 2026-04-25 (slice N7 — capture T2 settlement-test findings: gross-of-fees PnL accounting + Polymarket 422 fallback gap).*
 
 ---
 
@@ -192,6 +192,28 @@ The notebook also ran a from-scratch Monte Carlo simulator (10,000 paths) at thr
 - The notebook's MC simulator is a notebook-private implementation, separate from the bot's production `simulate_paths` function in `backend/core/monte_carlo.py`. The production path-dependent simulator is **NOT** verified by E1. A future verification slice should run an analogous notebook-vs-production check on `simulate_paths` and any other pricer functions the bot uses.
 - Verification was at one $(S_0, B, \mu, \sigma, T)$ point. Edge cases (very deep OTM, very long $T$, $\sigma \to 0$) were not exercised. The production code has guards for the corner cases ($B \le S_0$, etc.) but their numerical behavior at extreme parameters wasn't directly stress-tested.
 
+### 3l. PnL accounting is gross-of-fees (T2 finding, 2026-04-25)
+
+While writing T2's settlement test coverage, the test author confirmed that `calculate_pnl(trade, settlement_value)` in `backend/core/settlement.py` computes settlement PnL as:
+
+- on win: `pnl = size * (1.0 - entry_price)`
+- on loss: `pnl = -size * entry_price`
+
+with **no reference to `backend.core.fees` at the settlement boundary**. Fees are absorbed earlier — at signal-gate time, via `net_edge()`, which subtracts an estimated round-trip fee from raw edge before the trade is allowed through the `MIN_EDGE_THRESHOLD` filter (see `backend/core/fees.py:net_edge` and the execution-realism handoff doc earlier in this session). The settlement-time PnL number is therefore **gross-of-fees** by current design.
+
+**Implication for the project's PnL data:**
+
+- Every PnL number recorded in the database — every `Trade.pnl`, the cumulative `BotState.total_pnl`, the bankroll display — has a known systematic positive bias relative to true net realized PnL.
+- The size of the bias depends on per-trade fees, which vary by platform (Polymarket: 0% exchange + 10 bps slippage + $0.10 gas; Kalshi: per-contract `ceil(0.07 * p * (1-p) * 100) / 100` + 50 bps slippage) and by trade size. At Polymarket's $1–10 trade sizes the gas component dominates; at Kalshi's $13–17 sizes the per-contract fee dominates.
+
+**Interpretation rule when reading PnL data:**
+
+When evaluating performance, mentally subtract estimated round-trip fees per trade to get a more honest net number. Or, more rigorously, `SELECT SUM(pnl) FROM trades WHERE settled = 1` and subtract estimated total fees as a separate adjustment using `fees.estimate_round_trip_cost` per trade. Across 758 settled trades the aggregate fee impact is small per-trade but potentially meaningful in total — quantification deferred to the execution-realism work.
+
+**Status:**
+
+This is **intentional by current design, not a bug**. The execution-realism review (separate scoping doc, not yet a slice) plans to add a `Trade.fees_paid` column and deduct fees at settlement; when that ships, this finding gets a `[SUPERSEDED by 3X]` tag per Section 14a's append-only convention. The new tests in `TestCalculatePnl` (T2) explicitly pin the current gross-of-fees contract — when the execution-realism slice changes the contract, those tests need updated expected values.
+
 ---
 
 ## 4. Code Change Log (slice log)
@@ -245,6 +267,15 @@ The notebook also ran a from-scratch Monte Carlo simulator (10,000 paths) at thr
 - **Tests:** unchanged (notebook executes via `nbconvert --execute` cleanly; production test count remains 207). All 207 production tests pass post-install of notebook deps, confirming the new dependencies don't conflict with production package versions.
 - **Revert criterion:** none — pure additive learning artifact. Would only "revert" by deleting the notebook directory if it became misleading or stale.
 - **E is the education prefix.** Established here for learning artifacts (notebooks, derivations, walkthroughs). Joins S/T/C/P/N/A/B in the slice taxonomy.
+
+### Slice T2 — settlement.py test coverage (committed 2026-04-25, hash `9fe4a04`)
+
+- **What changed:** added 34 unit tests across 5 new test classes in `tests/test_settlement.py` covering `_parse_market_resolution` (pure parser, 6), `fetch_polymarket_resolution` (HTTP plumbing via `httpx.MockTransport`, 7), `calculate_pnl` (pure logic, 8), `settle_pending_trades` (orchestrator with in-memory SQLite + `mock.patch`, 8), and `update_bot_state_with_settlements` (BotState bookkeeping, 5). Test count 207 → 241. The B1 era's 10 `TestFetchKalshiResolution` tests were untouched.
+- **Production code change:** one minimal addition — added optional `http_client` kwarg to `fetch_polymarket_resolution` matching B1's pattern exactly. Non-behavioral testability refactor; production callers leave it `None` and get the same per-call `AsyncClient`. Verified by re-running B1's tests against the modified module — still green.
+- **Closes Audit Finding #4** (HIGH severity: settlement.py had zero tests pre-B1, partial post-B1, full post-T2).
+- **Two findings surfaced during the test work**, captured in this document rather than left only in commit history: (1) Section 3l — `calculate_pnl` is gross-of-fees by design, with implications for how PnL data should be read; (2) Section 8 roadmap — B2, a small bug-fix slice to widen Polymarket fetch's HTTP-error handling beyond just 404 (gamma-api returns 422 for invalid market IDs).
+- **Reusable infrastructure:** the in-memory SQLite fixture (`_make_in_memory_db`, `_make_pending_trade`, `_make_bot_state` helpers) is reusable for future settlement-area or other DB-touching tests. Per-test fresh engine, no shared state, no test-order dependencies. Negligible overhead.
+- **Revert criterion:** none — pure test additions plus one non-behavioral seam.
 
 ---
 
@@ -362,6 +393,7 @@ This note doesn't lower the bar for what counts as "model works" — it raises t
 3. **Logistic regression on features** — replace hand-coded composite weights with learned weights. Worth revisiting late summer 2026 when 500–1,000 feature-tagged trades exist.
 4. **Drop volatility from composite scoring** — confirmed dead weight in two independent diagnostics (3b). Do as cleanup whenever signal logic is being touched.
 5. **Investigate the 8–10% edge dip** — replicated across two cohorts (3a, 3e). Worth revisiting when post-change 8–10% bucket reaches n≈200, ~30–40 days from now.
+6. **B2 — Widen Polymarket resolution-fetch HTTP error handling** — production code in `fetch_polymarket_resolution` triggers the search-fallback path only on HTTP 404, but Polymarket's gamma-api actually returns **HTTP 422** for invalid market IDs (verified during T2 implementation). A 422 response would not trigger the fallback and the function would silently return `(False, None)`, leaving the trade stuck pending forever — same failure pattern as the B1 Kalshi credential-gate bug (Section 3j). Scope: ~1 line change to extend the status-code check (e.g., `in (404, 422)`) plus 1-2 new tests. Priority **low-medium**: hypothetical impact is "if a market_id ever becomes invalid, the trade gets stuck pending forever"; likelihood unknown but probably rare since market_ids are stable once issued. Worth fixing for defensive robustness given how cheap it is.
 
 ### Possibly worth doing (depends on findings)
 
@@ -398,6 +430,9 @@ This note doesn't lower the bar for what counts as "model works" — it raises t
 | **B1** | `da6ce41` | Fix Kalshi settlement to use public market endpoint (no credentials needed) — replaces silently-failing credential gate. **First MC settlements ever recorded in DB.** +10 unit tests in new `tests/test_settlement.py` (197→207). | 2026-04-25 |
 | **N4** | `ebeded8` | RESEARCH_NOTES update: capture first MC settlements (Section 3i), audit blind spot finding (Section 3j), reframe Section 6 checkpoints around April 25 first-settlements, document the C/P/B prefix taxonomy (Section 10) | 2026-04-25 |
 | **E1** | `c4a985b` | Add `notebooks/gbm_derivation.ipynb` — derivation, MC verification, failure-mode analysis, line-by-line read of `prob_one_touch_above_analytic`. Verified production matches notebook to floating-point precision (Section 3k). New `requirements-notebooks.txt` keeps notebook deps out of production `requirements.txt`. | 2026-04-25 |
+| **N5** | `ae63d5b` | RESEARCH_NOTES update: capture E1 findings (Section 3k pricer correctness, Section 6 calibration interpretation note for the 5-15 pp discrete-monitoring bias band, Section 11.1 GARCH-justification sharpening); add E to slice taxonomy (Section 10); introduce Section 14 document update protocol | 2026-04-25 |
+| **N6** | `bc0c351` | Add `BACKTESTER_SCOPE.md` — historical backtester scoping doc (BTC technical brain MVP only; MC and strategy-3 backtesting deferred). Section 1 cross-reference updated per Section 14f convention | 2026-04-25 |
+| **T2** | `9fe4a04` | Settlement.py test coverage — 5 new test classes covering `_parse_market_resolution`, `fetch_polymarket_resolution`, `calculate_pnl`, `settle_pending_trades`, `update_bot_state_with_settlements` (+34 tests, 207 → 241). Closes Audit Finding #4. One non-behavioral seam added (`http_client` kwarg on `fetch_polymarket_resolution` matching B1 pattern). Surfaced two findings: gross-of-fees PnL accounting (Section 3l) and Polymarket 422 fallback gap (Section 8 → B2 roadmap entry). | 2026-04-25 |
 
 ---
 

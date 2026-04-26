@@ -2,7 +2,7 @@
 
 *Project research memory. Companion to README.md (what the code does), ARCHITECTURE.md (historical, pre-rebuild), and STRATEGY3_SCOPE.md (cross-platform arbitrage scoping doc). This document captures what we have **learned**, what we have **decided**, and what we plan to **investigate**. It is updated as the project evolves — every diagnostic, parameter change, and checkpoint adds to it.*
 
-*Last meaningful update: 2026-04-25 (slice N4 — first MC settlements + audit blind spot + reflect P1/P2/B1/N3).*
+*Last meaningful update: 2026-04-25 (slice N5 — capture E1 GBM-derivation findings + add document update protocol as Section 14).*
 
 ---
 
@@ -174,6 +174,24 @@ The B1 bug surfaced a methodological gap in the comprehensive April 25 audit (`A
 
 This finding is methodologically important enough to flag here (rather than just in commit history) so future audits inherit the lesson.
 
+### 3k. Pricer implementation correctness verified (E1, 2026-04-25)
+
+The E1 GBM derivation notebook (`notebooks/gbm_derivation.ipynb`) independently re-derived the closed-form one-touch-above probability under GBM with drift and compared against the production implementation on a canonical test case ($S_0 = \$77{,}000$, $B = \$80{,}000$, $\mu = 0.10$/yr, $\sigma = 0.60$/yr, $T = 7$ d):
+
+- Notebook closed-form result: **0.6400293920**
+- Production `prob_one_touch_above_analytic`: **0.6400293920**
+- Difference: **0.00e+00** (matches to floating-point precision)
+
+The notebook also ran a from-scratch Monte Carlo simulator (10,000 paths) at three timestep granularities and showed convergence onto the closed-form: at 10,080 ~1-min steps the empirical estimate is 0.6397, gap 0.0003, well within Monte Carlo standard error. Both an algebraic re-derivation and a numerical simulator agree with production to as much precision as either method offers.
+
+**Implication for future calibration work:** when MC settlement data eventually shows divergence between predicted and realized touch rates (Section 6 decision gate, mid-May 2026), the divergence will come from **model assumptions**, not implementation bugs in the closed-form code. Don't waste investigation time grepping the pricer for arithmetic errors — the math is provably correct as coded. Look at the model's input assumptions (vol estimation, drift, GBM-vs-reality gap from Section 5 of the notebook) instead.
+
+**Limitation — what E1 did NOT verify:**
+
+- E1 verified `prob_one_touch_above_analytic` on one canonical test case. The mirror function `prob_one_touch_below_analytic` is implied correct by the same reflection-principle symmetry argument, but was not directly numerically tested.
+- The notebook's MC simulator is a notebook-private implementation, separate from the bot's production `simulate_paths` function in `backend/core/monte_carlo.py`. The production path-dependent simulator is **NOT** verified by E1. A future verification slice should run an analogous notebook-vs-production check on `simulate_paths` and any other pricer functions the bot uses.
+- Verification was at one $(S_0, B, \mu, \sigma, T)$ point. Edge cases (very deep OTM, very long $T$, $\sigma \to 0$) were not exercised. The production code has guards for the corner cases ($B \le S_0$, etc.) but their numerical behavior at extreme parameters wasn't directly stress-tested.
+
 ---
 
 ## 4. Code Change Log (slice log)
@@ -218,6 +236,15 @@ This finding is methodologically important enough to flag here (rather than just
 - **Tests:** 10 new unit tests in `tests/test_settlement.py` (first test_settlement.py in the project; audit T2 noted the gap). Covers happy paths, not-yet-resolved paths, error paths, defensive shape handling. Test count 197 → 207.
 - **Revert criterion:** none — pure correctness fix. The code was non-functional before; it's functional now.
 - **B is the bug-fix prefix.** Established here, distinct from S (strategy), T (tools), C (cleanup), P (performance), N (notes), A (arbitrage).
+
+### Slice E1 — GBM derivation notebook + notebooks/ requirements split (committed 2026-04-25, hash `c4a985b`)
+
+- **What changed:** new `notebooks/` directory holding learning artifacts that aren't imported by the bot. First notebook is `gbm_derivation.ipynb` — a 7-section walkthrough that derives the closed-form one-touch barrier formula from the reflection principle, builds an independent Monte Carlo simulator, walks GBM's failure modes on real BTC data, and reads the production `prob_one_touch_above_analytic` line by line. Also added `requirements-notebooks.txt` at repo root for matplotlib + jupyter tooling — kept separate from `requirements.txt` so the production deployment surface stays minimal.
+- **Runtime behavior:** none. No production code was modified. `requirements.txt` is byte-for-byte unchanged. The bot is unaffected.
+- **What was verified:** notebook closed-form result matches production `prob_one_touch_above_analytic` to floating-point precision (gap = 0.00e+00) on the canonical test case. Independent MC simulator with 10k paths × 10080 timesteps converges to the closed-form within Monte Carlo standard error. See Section 3k for full details and limitations.
+- **Tests:** unchanged (notebook executes via `nbconvert --execute` cleanly; production test count remains 207). All 207 production tests pass post-install of notebook deps, confirming the new dependencies don't conflict with production package versions.
+- **Revert criterion:** none — pure additive learning artifact. Would only "revert" by deleting the notebook directory if it became misleading or stale.
+- **E is the education prefix.** Established here for learning artifacts (notebooks, derivations, walkthroughs). Joins S/T/C/P/N/A/B in the slice taxonomy.
 
 ---
 
@@ -298,6 +325,20 @@ The first MC settlements actually occurred on 2026-04-25 (3 KXBTCD daily contrac
 - This is the "don't run a losing strategy forever" gate. Documented in `MC_PILOT_BANKROLL_USD` comment.
 - **Now actually evaluable** post-B1: prior to 2026-04-25, the bot's settlement loop never executed end-to-end, so this stopping criterion was unreachable in practice. The 90-day clock effectively starts 2026-04-25 (first real settlements), not the original `MC_PILOT_BANKROLL_USD` introduction date. Total elapsed days at this checkpoint: ~89 days of *settled* data.
 
+### Calibration interpretation note (added in slice N5)
+
+When evaluating MC calibration in upcoming settlements (April 30 monthly + ongoing daily), expect the bot to systematically **over-predict touch probabilities by an order of magnitude of 5-15 pp for purely structural reasons**. The bot's pricer is a continuous-time formula; Kalshi resolves discretely (at most one observation per contract, snapshotted at close time). A continuous-monitoring formula counts barrier crossings that bounce back before the next observation — which a discretely-monitored market cannot reward. So predicted touch rate > realized rate is the *expected* default, not evidence of a broken model.
+
+The E1 notebook quantified this discrete-monitoring bias on a canonical 7-day daily-cadence example: at 7 daily timesteps the MC undershoots the continuous-time closed-form by ~13.9 pp; at hourly steps by ~3.4 pp; at ~1-min steps by ~0.03 pp. Real Kalshi monitoring is even sparser than 7 daily steps for end-of-day-snapshot products, so the structural bias on this bot's contracts is in the upper end of that range. The 5-15 pp framing is a notebook-derived order-of-magnitude estimate — **not a calibrated number specific to KXBTCD daily contracts** — and the exact magnitude depends on path volatility, barrier distance, and the contract's exact resolution mechanics (single-snapshot at close vs. any-time-during-the-day).
+
+**Implication for the kill criteria above:**
+
+- The kill criterion is NOT "predicted touch rate ≠ realized touch rate." A consistent predicted > realized gap of ~5-15 pp is the expected null behavior under a correctly-implemented GBM pricer applied to a discretely-monitored market.
+- Real evidence of a broken model is calibration error **larger than this structural bias**, OR systematic error in **the opposite direction** (realized > predicted — meaning the market is touching MORE than even a continuous-monitoring formula predicts, which would point to fat tails or vol underestimation rather than the discrete-monitoring artifact).
+- For the 2026-04-30 and mid-May n≈30 evaluations: do the calibration analysis, then compare the realized gap to the 5-15 pp structural-bias band before concluding anything. Specifically reject the model only if the gap is > ~20 pp in the over-prediction direction or any non-trivial gap in the under-prediction direction.
+
+This note doesn't lower the bar for what counts as "model works" — it raises the bar for what counts as "model broken," to avoid mistaking known structural bias for genuine miscalibration.
+
 ---
 
 ## 7. Things Explicitly Decided NOT to Do (and why)
@@ -355,6 +396,8 @@ The first MC settlements actually occurred on 2026-04-25 (3 KXBTCD daily contrac
 | **N3** | `c38fb00` | Add `STRATEGY3_SCOPE.md` — cross-platform arbitrage scoping doc (Polymarket BTC ↔ Kalshi KXBTCD pairs trade); top-level artifact alongside RESEARCH_NOTES | 2026-04-25 |
 | **P2** | `dc0861f` | Cache `scan_for_signals` results keyed on `(underlying, scan_cycle_id)` so dashboard reuses scheduler-produced scans (`/api/dashboard` 4.0s → ~2.0s, additional ~50% reduction) | 2026-04-25 |
 | **B1** | `da6ce41` | Fix Kalshi settlement to use public market endpoint (no credentials needed) — replaces silently-failing credential gate. **First MC settlements ever recorded in DB.** +10 unit tests in new `tests/test_settlement.py` (197→207). | 2026-04-25 |
+| **N4** | `ebeded8` | RESEARCH_NOTES update: capture first MC settlements (Section 3i), audit blind spot finding (Section 3j), reframe Section 6 checkpoints around April 25 first-settlements, document the C/P/B prefix taxonomy (Section 10) | 2026-04-25 |
+| **E1** | `c4a985b` | Add `notebooks/gbm_derivation.ipynb` — derivation, MC verification, failure-mode analysis, line-by-line read of `prob_one_touch_above_analytic`. Verified production matches notebook to floating-point precision (Section 3k). New `requirements-notebooks.txt` keeps notebook deps out of production `requirements.txt`. | 2026-04-25 |
 
 ---
 
@@ -392,7 +435,7 @@ This document is a living artifact. **Update it after every meaningful event:**
 - Don't speculate beyond what evidence supports. Flag wide CIs and small-sample findings explicitly.
 - Keep sections scannable: short paragraphs and bullet lists, not walls of text.
 - When a finding contradicts a prior entry, **don't delete the prior entry** — append a dated update so the history of belief is preserved.
-- Commit conventions — slice prefix taxonomy (current as of slice N4):
+- Commit conventions — slice prefix taxonomy (current as of slice N5):
   - **S** — strategy/parameter changes that alter trade decisions or sizing (`MIN_EDGE_THRESHOLD`, concentration caps, etc.)
   - **T** — tooling and diagnostic harnesses (replay scripts, audit utilities)
   - **C** — cleanup and dead-code deletion
@@ -400,6 +443,7 @@ This document is a living artifact. **Update it after every meaningful event:**
   - **N** — notes and documentation updates to this file or other top-level artifacts
   - **A** — arbitrage / strategy 3 work (introduced with `STRATEGY3_SCOPE.md`, slice N3)
   - **B** — bug fixes (introduced with B1; distinct from S because correctness-restoring rather than strategy-tuning)
+  - **E** — education / learning artifacts (notebooks, derivations, walkthroughs that aren't imported by the bot but make production black-boxes legible). Introduced with E1 (`notebooks/gbm_derivation.ipynb`).
 
 This document complements `README.md` (what the code does today) and `ARCHITECTURE.md` (historical, marked stale). When the three disagree, this document is the source of truth for **research state**; README is the source of truth for **code shape**; ARCHITECTURE is no longer authoritative for anything.
 
@@ -416,6 +460,8 @@ This document complements `README.md` (what the code does today) and `ARCHITECTU
 Items that may become relevant depending on what existing strategy evaluations reveal.
 
 - **GARCH volatility modeling for the MC brain** — currently the MC brain's volatility estimator uses simple realized volatility from recent price history (EWMA optional, plain σ as the default). GARCH would model volatility as time-varying with autocorrelation. Becomes relevant **only if** accumulated MC settlements show GBM-with-realized-vol pricing is meaningfully off. If GBM works, GARCH adds complexity without benefit. **Decision gate (revised in slice N4):** evaluate when daily-cadence settlement sample reaches **n≈30 (estimated mid-May 2026)** — earlier than the original "after April 30" framing because B1 unblocked daily settlement collection on 2026-04-25, and KXBTCD settles ~daily. The April 30 monthly settlements remain a complementary data point but daily-cohort calibration data accumulates faster. See Section 6, "Interim — daily KXBTCD settlement accumulation."
+
+  **Refinement from slice E1 (2026-04-25):** the E1 GBM-derivation notebook empirically refuted the textbook intuition that "fat tails raise touch probability" for this bot's typical contract structure. At near-money barriers (the regime where Kalshi daily KXBTCD contracts cluster, ~3-5% out-of-the-money), variance-preserving Student-t innovations actually **lower** touch probability vs Gaussian by 2-5 pp. Mechanism: standardizing fat-tailed distributions to unit variance moves probability mass from the body to *both* peaks and tails simultaneously; the body shortage hurts near-money touch accumulation more than the fatter tails help. The same effect persists (smaller, ~1 pp) at +14% OTM. So if calibration data eventually shows the bot systematically over-pricing touches **after accounting for the structural discrete-monitoring bias** (Section 6's calibration interpretation note), heavy-tailed residual models are NOT the right upgrade — the dominant real failure modes are vol non-stationarity (a wrong σ, particularly during volatility-clustering events) and discrete-jump events (Merton-style jump-diffusion). The contingent upgrade should therefore be **GARCH for time-varying σ and/or a jump-diffusion term**, NOT a heavy-tailed-residual model like GBM-with-Student-t.
 
 - **Regime detection for cross-strategy evaluation** — already on the active roadmap (Section 8, "Possibly worth doing"); reiterating here as part of the long-term radar so it stays visible in the radar inventory. Becomes critical when market conditions change and we need to evaluate whether existing strategies' edge is regime-dependent.
 
@@ -469,3 +515,72 @@ Section 11 grows over time as new ideas surface. The discipline:
 - Items that get **promoted** to active roadmap (Section 8) move out of Section 11.
 - Items that get **explicitly rejected** move to 11.5 with reasoning.
 - This section is **descriptive** of "what we're considering," not **prescriptive** of "what we'll build."
+
+---
+
+## 14. Document update protocol
+
+*Added in slice N5 (2026-04-25). Sections 12 and 13 are intentionally unused — Section 14 is the canonical home for document-update conventions, and the gap leaves room for future structural sections without renumbering this one.*
+
+The conventions below are mostly already practiced across earlier sections. Section 14 makes them explicit so future-me doesn't have to reverse-engineer them from the document's history.
+
+### 14a. Findings (Section 3) are append-only
+
+Section 3 subsections (3a, 3b, ..., 3k, ...) are **never deleted**, even when superseded. The historical record is the point — future-me needs to see how thinking evolved, what was believed and later overturned, and on what evidence.
+
+If a finding is overturned by better data:
+
+- **Add a successor subsection** (e.g., 3m) that states the new finding with its evidence base.
+- **Add a `[SUPERSEDED by 3m]` tag inline at the very start** of the original subsection, so a reader scanning Section 3 sees immediately that the original is no longer current.
+- **Do not modify the original subsection's body.** It stays as a snapshot of what was true (or believed true) at its writing date.
+
+### 14b. Snapshot sections preserve historical state inline (Section 5 convention)
+
+Sections that capture point-in-time state — currently just Section 5 (Open Positions Snapshot) — get refreshed in place but **always preserve prior snapshots inline** rather than overwriting them. Concretely:
+
+- A new "Current snapshot" subsection holds the latest state.
+- The previously-current snapshot is renamed to "Prior snapshot — [slice or date]" and kept underneath, in chronological order.
+- Section 5 already practices this (the pre-B1 snapshot from 2026-04-25 ~14:00 UTC is preserved underneath the post-B1 snapshot). The inline preamble of Section 5 documents the convention as well; this entry consolidates it as a project-wide rule.
+
+The reason: position state changes faster than research conclusions, but the history of what positions were open at what time is exactly what you want when reconstructing whether a strategy was correctly cap-bound or whether a settlement event hit a position the bot held. Lossy overwrites destroy that.
+
+### 14c. Roadmap items (Section 8) move from open list to Completed table
+
+Section 8 has two structural lists: a **prioritized open list** (with subsections "Probably worth doing", "Possibly worth doing", "Operational improvements", "Probably never worth doing") and a **"Completed since last update" table** at the bottom.
+
+When a roadmap item ships:
+
+- Remove its bullet from the open list.
+- Add a row to the Completed table with: slice ID (e.g., `**P1**`), commit hash, one-line description with concrete impact, completion date.
+- Order the table chronologically by commit, oldest first.
+- The table is cumulative since the last meaningful Section 8 refresh — N-slices that update Section 8 reset the table window implicitly. This isn't strict; if the table grows long, future refactors can prune it (but only into the prior section history of past N-slice update commits, never silently).
+
+### 14d. Slice prefix conventions (S/T/C/P/N/A/B/E) live in Section 10
+
+The full slice prefix taxonomy and what each letter means lives in **Section 10 ("How to Use This Document"), under "Style conventions"**. New prefixes are introduced when a class of work doesn't fit the existing letters; the introducing commit also updates Section 10 to add the new entry. Section 14 itself does NOT duplicate the taxonomy table — that would create two sources of truth that could drift. Section 14 is the *meta* layer; Section 10 is the *list*.
+
+When introducing a new prefix in a slice:
+
+- Add a one-line entry to Section 10's taxonomy bullet list, with the introducing slice noted (e.g., "*introduced with slice E1*").
+- Add the new prefix to the change log entry's body so the reader of Section 4 sees that the prefix was established here.
+- Keep the alphabet small. Prefixes earn their place by representing a category of work that recurs.
+
+### 14e. The "Last meaningful update" header references the most recent N-slice
+
+The italicized line at the very top of the document — `*Last meaningful update: ...*` — is updated **every time any N-slice lands**. The format is `(slice N{n} — one-line summary of what changed)`. This is the at-a-glance signal to a reader that this document is current as of a specific known point in the project's history.
+
+Non-N slices (S, T, C, P, A, B, E) update this header **only if** they explicitly modify RESEARCH_NOTES.md as part of their commit (rare — the convention is that code-changing slices add their entry to Section 4 in the next N-slice, not in their own commit). E.g., slice B1's commit modified `backend/core/settlement.py` and `tests/test_settlement.py` only; slice N4 was the commit that brought RESEARCH_NOTES into sync with B1.
+
+### 14f. Cross-document references in Section 1
+
+When a slice creates a top-level companion artifact (a new `.md` file at the repo root that this document should reference), Section 1's opening paragraph — which lists companion documents — gets an additional reference. Examples:
+
+- `STRATEGY3_SCOPE.md` was added by slice N3 → Section 1 now lists it as a companion.
+- `AUDIT_2026-04-25.md` was created by the comprehensive audit but is a working document that may be deleted later — Section 1 does NOT list it (working artifacts are not stable enough to commit to a cross-reference).
+- `notebooks/gbm_derivation.ipynb` was added by slice E1 → it's referenced in Section 3k and Section 11.1 by file path, but it lives under `notebooks/` (not at repo root) and is one of an expected family of learning artifacts, so the cross-reference goes via `notebooks/README.md` which itself indexes the family. Section 1 does not need updating for individual notebooks; it would need updating if `notebooks/README.md` itself became a stable companion document.
+
+The general principle: Section 1's list of companions is short and load-bearing. Add to it when a new artifact is genuinely a stable, document-level peer. Don't add to it for working files, generated outputs, or members of an indexed family.
+
+### 14g. When in doubt: append, don't rewrite
+
+The unifying rule across 14a–14f: **the document's history is part of its value**. When a section needs new information, the default is to add — a new subsection, a new bullet, a new row, a `[SUPERSEDED]` tag — rather than to silently replace existing content. The ledger of how thinking evolved is more valuable than the cleanliness of any single moment's snapshot. A reader six months from now needs to be able to reconstruct *why* the project ended up where it did, not just *what* the current state is.

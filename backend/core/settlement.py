@@ -11,7 +11,12 @@ from backend.models.database import Trade, BotState, Signal
 logger = logging.getLogger("trading_bot")
 
 
-async def fetch_polymarket_resolution(market_id: str, event_slug: Optional[str] = None) -> Tuple[bool, Optional[float]]:
+async def fetch_polymarket_resolution(
+    market_id: str,
+    event_slug: Optional[str] = None,
+    *,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> Tuple[bool, Optional[float]]:
     """
     Fetch actual market resolution from Polymarket API.
 
@@ -19,9 +24,17 @@ async def fetch_polymarket_resolution(market_id: str, event_slug: Optional[str] 
 
     Returns: (is_resolved, settlement_value)
         - settlement_value: 1.0 if Up won, 0.0 if Down won
+
+    `http_client` is an injection seam for tests (matches the same pattern
+    in _fetch_kalshi_resolution and mc_execution.fetch_current_ask);
+    production callers leave it None to get a fresh per-call client.
+    Added in slice T2 to enable httpx.MockTransport-based unit tests
+    without touching the real Polymarket gamma-api.
     """
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient(timeout=10.0)
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
             # Try event slug first (more reliable for BTC 5-min markets)
             if event_slug:
                 response = await client.get(
@@ -48,9 +61,12 @@ async def fetch_polymarket_resolution(market_id: str, event_slug: Optional[str] 
             market = response.json()
             return _parse_market_resolution(market)
 
-    except Exception as e:
-        logger.warning(f"Failed to fetch resolution for {event_slug or market_id}: {e}")
-        return False, None
+        except Exception as e:
+            logger.warning(f"Failed to fetch resolution for {event_slug or market_id}: {e}")
+            return False, None
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 async def _search_market_in_events(market_id: str) -> Tuple[bool, Optional[float]]:
